@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.next/
+.vercel/
 coverage/
 .env
 .env.*
@@ -11,7 +13,7 @@ coverage/
 vite.config.d.ts
 scripts/**/*.d.ts
 src/**/*.d.ts
-!src/vite-env.d.ts
+!next-env.d.ts
 playwright-report/
 test-results/
 .vite/

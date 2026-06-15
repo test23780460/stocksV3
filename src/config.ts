@@ -13,10 +13,10 @@ export const appConfig = {
     "Accounts are intended for ages 13+. Minors should involve a parent or guardian before making financial decisions.",
   roles: ["guest", "free", "premium", "admin"] satisfies UserRole[],
   publicEnv: {
-    supabaseUrl: import.meta.env.VITE_SUPABASE_URL || "",
-    supabaseAnonKey: import.meta.env.VITE_SUPABASE_ANON_KEY || "",
-    appUrl: import.meta.env.VITE_APP_URL || "",
-    basePath: import.meta.env.VITE_GITHUB_PAGES_BASE_PATH || "/stocksV3/"
+    supabaseUrl: process.env.NEXT_PUBLIC_SUPABASE_URL || "",
+    supabaseAnonKey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "",
+    appUrl: process.env.NEXT_PUBLIC_APP_URL || "",
+    basePath: ""
   },
   demoStatus: "Demo" as DataStatus
 };
@@ -47,4 +47,3 @@ export const routeLabels = [
 ] as const;
 
 export type RouteLabel = (typeof routeLabels)[number];
-

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-labelledby="title desc">
+  <title id="title">Market Signal Deck</title>
+  <desc id="desc">Dark market research dashboard preview with price chart and signal cards.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#061019"/>
+      <stop offset="1" stop-color="#0e2433"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="72" y="70" width="1056" height="490" rx="18" fill="#0f1d2b" stroke="#284456"/>
+  <text x="112" y="138" fill="#22d3ee" font-family="Inter, Arial, sans-serif" font-size="30" font-weight="800">Stocks V3</text>
+  <text x="112" y="204" fill="#edf5ff" font-family="Inter, Arial, sans-serif" font-size="64" font-weight="900">Market Signal Deck</text>
+  <text x="112" y="258" fill="#92a4b8" font-family="Inter, Arial, sans-serif" font-size="28">Research stocks, crypto, ETFs, indexes, news, alerts, and predictions.</text>
+  <polyline points="118,438 210,394 302,418 394,326 486,350 578,260 670,284 762,210 854,236 946,172 1038,196" fill="none" stroke="url(#accent)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="112" y="316" width="196" height="74" rx="10" fill="#102638" stroke="#284456"/>
+  <text x="136" y="360" fill="#edf5ff" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Demo Mode</text>
+  <rect x="338" y="316" width="196" height="74" rx="10" fill="#102638" stroke="#284456"/>
+  <text x="362" y="360" fill="#22c55e" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Watch MSFT</text>
+  <rect x="564" y="316" width="196" height="74" rx="10" fill="#102638" stroke="#284456"/>
+  <text x="588" y="360" fill="#f59e0b" font-family="Inter, Arial, sans-serif" font-size="22" font-weight="700">Risk Visible</text>
+</svg>
