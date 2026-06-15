@@ -16,9 +16,10 @@ export default defineConfig({
     sourcemap: false,
     rollupOptions: {
       output: {
-        manualChunks: {
-          charts: ["lightweight-charts"],
-          supabase: ["@supabase/supabase-js"]
+        manualChunks(id) {
+          if (id.includes("lightweight-charts")) return "charts";
+          if (id.includes("@supabase")) return "supabase";
+          return undefined;
         }
       }
     }
