@@ -44,6 +44,8 @@ export interface NewsItem {
   relatedSymbols: string[];
   summary: string;
   url?: string;
+  provider?: string;
+  dataStatus?: DataStatus;
 }
 
 export interface Prediction {
@@ -133,4 +135,3 @@ export interface ScenarioInput {
   possibleGainPercent: number;
   possibleLossPercent: number;
 }
-

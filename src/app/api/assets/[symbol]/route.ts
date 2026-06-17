@@ -1,19 +1,23 @@
 import { NextResponse } from "next/server";
 import { demoAssets } from "../../../../data/fixtures";
 import { cryptoIdForSymbol, getCryptoHistory, getCryptoQuote, getRuntimeStatus, getStockHistory, getStockQuote } from "../../../../services/marketData";
+import { parseOrBadRequest, symbolSchema } from "../../../../services/apiValidation";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(_request: Request, context: { params: Promise<{ symbol: string }> }) {
-  const { symbol } = await context.params;
-  const asset = demoAssets.find((item) => item.symbol.toUpperCase() === symbol.toUpperCase());
+  const params = await context.params;
+  const parsed = parseOrBadRequest(symbolSchema, params.symbol);
+  if (parsed.error) return NextResponse.json(parsed.error, { status: 400 });
+  const symbol = parsed.data;
+  const asset = demoAssets.find((item) => item.symbol.toUpperCase() === symbol);
 
   if (!asset) {
     return NextResponse.json(
       {
         error: "asset_not_found",
         message: "This symbol is not available in the current Demo Mode fixture set.",
-        symbol: symbol.toUpperCase(),
+        symbol,
         status: getRuntimeStatus()
       },
       { status: 404 }

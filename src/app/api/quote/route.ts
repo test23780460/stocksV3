@@ -1,19 +1,19 @@
 import { NextResponse } from "next/server";
 import { getStockQuote, notFoundResponse, serverErrorResponse } from "../../../services/marketData";
+import { booleanStringSchema, parseOrBadRequest, symbolSchema } from "../../../services/apiValidation";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
-  const symbol = url.searchParams.get("symbol")?.trim();
-  const refresh = url.searchParams.get("refresh") === "true";
+  const symbol = parseOrBadRequest(symbolSchema, url.searchParams.get("symbol") ?? "");
+  const refresh = parseOrBadRequest(booleanStringSchema, url.searchParams.get("refresh") ?? undefined);
 
-  if (!symbol) {
-    return NextResponse.json({ error: "bad_request", message: "Missing required symbol query parameter." }, { status: 400 });
-  }
+  if (symbol.error) return NextResponse.json(symbol.error, { status: 400 });
+  if (refresh.error) return NextResponse.json(refresh.error, { status: 400 });
 
   try {
-    const quote = await getStockQuote(symbol, { refresh });
+    const quote = await getStockQuote(symbol.data, { refresh: Boolean(refresh.data) });
     return NextResponse.json(quote, {
       headers: {
         "Cache-Control": refresh ? "no-store" : "s-maxage=30, stale-while-revalidate=120"

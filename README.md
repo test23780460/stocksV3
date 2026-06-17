@@ -10,8 +10,9 @@ Educational market research only. Nothing in this project is financial advice. P
 - Hosting target: Vercel connected to the GitHub repository
 - API routes: Vercel serverless handlers under `src/app/api`
 - Cron route: `/api/ingest` scheduled once per day through `vercel.json` for Vercel Hobby compatibility
-- Demo fallback: deterministic fixtures for assets, charts, news, predictions, provider health, and alerts
-- Storage/auth readiness: Supabase migrations, RLS, and disabled auth UI until Supabase env vars are configured
+- Demo fallback: deterministic fixtures for unavailable assets, charts, news, predictions, provider health, and alerts
+- Storage/auth readiness: Supabase migrations, RLS, server-side ingestion, local signed-out watchlists/alerts, and disabled auth UI until Supabase env vars are configured
+- Routing: shareable Next.js URLs for dashboard, market categories, asset pages, research tools, account pages, status, and protected admin paths
 
 ## Local Installation
 
@@ -69,16 +70,23 @@ The app works before keys are added. Missing provider keys activate visible Demo
 ## API Routes
 
 - `GET /api/status`: public runtime/provider status with no secret values
-- `GET /api/market`: safe asset, news, and provider-health snapshot
+- `GET /api/markets`: safe asset, news, and provider-status snapshot
+- `GET /api/market`: compatibility alias for market snapshot
 - `GET /api/assets/:symbol`: asset detail or an honest asset-not-found response
+- `GET /api/quote?symbol=AAPL`: validated stock quote route
+- `GET /api/history?symbol=AAPL&range=1Y&interval=1D`: range-specific stock history route
+- `GET /api/search?q=Apple`: provider-backed search with demo fallback
 - `GET /api/news`: filterable demo news, with `symbol` and `q` query params
-- `POST /api/refresh`: user-facing refresh action that queues or simulates refresh safely
-- `GET|POST /api/alerts`: demo alert read/create endpoint
-- `GET|POST /api/ingest`: Vercel cron-safe backend logging route
+- `GET /api/crypto/quote?id=bitcoin`: CoinGecko-backed crypto quote route
+- `GET /api/crypto/history?id=bitcoin&range=1Y`: crypto price-series history route
+- `POST /api/refresh`: user-facing refresh action that returns the refreshed market payload directly
+- `GET|POST /api/alerts`: validated demo/local alert endpoint until Supabase Auth is configured
+- `GET|POST /api/ingest`: Vercel cron-safe backend ingestion route
+- `GET /api/admin/diagnostics`: protected admin diagnostics, 401/403 unless Supabase Auth confirms an admin role
 
 ## Demo Mode
 
-Demo Mode uses fixed fixture assets, timestamps, news, charts, predictions, alert rules, and provider states. It is visibly labeled and never claimed as live data. When Vercel environment variables are configured, the serverless routes are ready for secure provider adapters without exposing keys to the browser.
+Demo Mode uses fixed fixture assets, timestamps, news, charts, predictions, alert rules, and provider states when a provider is missing or unavailable. It is visibly labeled and never claimed as live data. Provider adapters run only in serverless routes, and private keys are never exposed to the browser.
 
 ## Supabase Setup
 
@@ -99,7 +107,8 @@ RLS allows users to read public market information and manage only their own pro
 
 ## Known Limitations
 
-- Live market provider adapters are scaffolded but not connected to real APIs yet.
+- Stock provider adapters require Vercel keys before they can return provider-supplied stock data.
 - Supabase Auth UI is disabled until public Supabase values are configured.
-- Notification delivery is simulated in Demo Mode.
+- Notification delivery is simulated until an email, push, Discord, or webhook provider is configured.
 - Options data is intentionally unavailable until a provider supports chains and Greeks.
+- Vercel Hobby cron runs daily at `09:00 UTC`; more frequent schedules require a supported plan or a separate scheduler.

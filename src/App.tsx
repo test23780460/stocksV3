@@ -38,33 +38,10 @@ import { glossaryTerms, searchGlossary } from "./data/glossary";
 import { calculateMarketMood, calculateScenario } from "./lib/calculations";
 import { compactNumber, currency, formatDateTime, percent } from "./lib/format";
 import { explainStatus, statusSeverity } from "./lib/dataStatus";
+import { parseRoutePath, pathForAsset, pathForRoute, type RouteId } from "./lib/routing";
 import { hasSupabaseConfig } from "./supabaseClient";
 import type { Asset, AssetType, NewsItem, ProviderHealth, SignalLabel } from "./types";
-import type { HistoryEnvelope, RuntimeStatus } from "./services/marketData";
-
-type RouteId =
-  | "dashboard"
-  | "stocks"
-  | "crypto"
-  | "etfs"
-  | "indexes"
-  | "news"
-  | "screener"
-  | "predictions"
-  | "compare"
-  | "ideas"
-  | "watchlists"
-  | "alerts"
-  | "learn"
-  | "definitions"
-  | "profile"
-  | "settings"
-  | "status"
-  | "admin"
-  | "backend"
-  | "quality"
-  | "api-usage"
-  | "audit";
+import type { ApiQuote, HistoryEnvelope, RuntimeStatus, SearchResult } from "./services/marketData";
 
 type ExperienceMode = "beginner" | "intermediate" | "advanced";
 type SortKey = "symbol" | "price" | "changePercent" | "volume" | "risk" | "confidence";
@@ -76,6 +53,19 @@ type MarketPayload = {
   generatedAt: string;
   cache: { hit: boolean; stale: boolean; ttlSeconds: number };
 };
+
+type Watchlist = { id: string; name: string; symbols: string[]; notes: string };
+type AlertRule = { id: string; symbol: string; type: string; value: string; enabled: boolean; demo: boolean; lastChecked?: string; triggerCount?: number };
+
+const defaultWatchlists: Watchlist[] = [
+  { id: "default", name: "Default Research", symbols: ["MSFT", "SPY", "BTC-USD"], notes: "Signed-out local watchlist." },
+  { id: "risk", name: "High Risk Watch", symbols: ["TSLA", "SOL-USD"], notes: "Keep position sizing research conservative." }
+];
+
+const defaultAlertRules: AlertRule[] = [
+  { id: "price-msft", symbol: "MSFT", type: "Price above", value: "490", enabled: true, demo: true, triggerCount: 0 },
+  { id: "risk-tsla", symbol: "TSLA", type: "Provider outage", value: "any", enabled: true, demo: true, triggerCount: 0 }
+];
 
 interface NavItem {
   id: RouteId;
@@ -160,6 +150,37 @@ const cryptoApiId = (symbol: string) => {
   return symbol.toLowerCase();
 };
 
+const quoteToAsset = (quote: ApiQuote, existing?: Asset): Asset => {
+  const template = existing ?? demoAssets.find((asset) => asset.type === quote.type) ?? demoAssets[0];
+  return {
+    ...template,
+    symbol: quote.symbol,
+    name: quote.name,
+    type: quote.type,
+    price: quote.price,
+    change: quote.change,
+    changePercent: quote.changePercent,
+    open: quote.open,
+    previousClose: quote.previousClose,
+    dayHigh: quote.dayHigh,
+    dayLow: quote.dayLow,
+    volume: quote.volume,
+    exchange: existing?.exchange ?? (quote.type === "crypto" ? "Crypto" : "Provider"),
+    sector: existing?.sector ?? (quote.type === "crypto" ? "Crypto" : "Provider result"),
+    bars: existing?.bars ?? template.bars,
+    meta: {
+      ...template.meta,
+      provider: quote.provider,
+      providerTimestamp: quote.timestamp,
+      ingestionTimestamp: new Date().toISOString(),
+      lastUpdated: quote.timestamp,
+      marketStatus: quote.marketStatus,
+      dataStatus: quote.dataStatus
+    },
+    explanation: existing?.explanation ?? "Provider search result. Non-price research metrics remain demo-derived until provider enrichment is configured."
+  };
+};
+
 function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: string }) {
   return <span className={`badge ${tone}`}>{children}</span>;
 }
@@ -239,16 +260,20 @@ function AssetRow({
   );
 }
 
-export default function App() {
-  const [route, setRoute] = useState<RouteId>("dashboard");
+export default function App({ initialPath = "/" }: { initialPath?: string }) {
+  const initialRoute = parseRoutePath(initialPath);
+  const [route, setRoute] = useState<RouteId>(initialRoute.route);
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [experience, setExperience] = useState<ExperienceMode>("beginner");
-  const [adminMode, setAdminMode] = useState(false);
+  const adminMode = false;
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [selectedSymbol, setSelectedSymbol] = useState("MSFT");
+  const [selectedSymbol, setSelectedSymbol] = useState(initialRoute.selectedSymbol ?? "MSFT");
   const [query, setQuery] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const [activeSuggestion, setActiveSuggestion] = useState(0);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
   const [recentSearches, setRecentSearches] = useState<string[]>([]);
   const [toast, setToast] = useState("Demo Mode active. Add provider keys in Vercel to enable live data.");
   const [lastRefresh, setLastRefresh] = useState("2026-06-15T14:36:03-04:00");
@@ -257,29 +282,47 @@ export default function App() {
   const [marketNews, setMarketNews] = useState<NewsItem[]>(demoNews);
   const [providerRows, setProviderRows] = useState<ProviderHealth[]>(providerHealth);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
-  const [watchlists, setWatchlists] = useState([
-    { id: "default", name: "Default Research", symbols: ["MSFT", "SPY", "BTC-USD"], notes: "Demo local watchlist." },
-    { id: "risk", name: "High Risk Watch", symbols: ["TSLA", "SOL-USD"], notes: "Keep position sizing research conservative." }
-  ]);
+  const [watchlists, setWatchlists] = useState<Watchlist[]>(defaultWatchlists);
   const [activeWatchlist, setActiveWatchlist] = useState("default");
   const [watchlistSort, setWatchlistSort] = useState<SortKey>("symbol");
-  const [alertRules, setAlertRules] = useState([
-    { id: "price-msft", symbol: "MSFT", type: "Price above", value: "490", enabled: true, demo: true },
-    { id: "risk-tsla", symbol: "TSLA", type: "Risk increase", value: "75", enabled: true, demo: true }
-  ]);
+  const [alertRules, setAlertRules] = useState<AlertRule[]>(defaultAlertRules);
   const [screenerType, setScreenerType] = useState<"all" | AssetType>("all");
   const [screenerSearch, setScreenerSearch] = useState("");
   const [screenerSort, setScreenerSort] = useState<SortKey>("confidence");
   const [screenerPage, setScreenerPage] = useState(1);
   const [scenarioAmount, setScenarioAmount] = useState(1000);
   const searchRef = useRef<HTMLDivElement | null>(null);
+  const refreshReadyAt = useRef(0);
 
   const selectedAsset = marketAssets.find((asset) => asset.symbol === selectedSymbol) ?? marketAssets[0] ?? demoAssets[0];
+  const selectedRouteMissing =
+    ["stocks", "crypto", "etfs", "indexes"].includes(route) && selectedSymbol && !marketAssets.some((asset) => asset.symbol === selectedSymbol);
   const mood = useMemo(() => calculateMarketMood(marketAssets), [marketAssets]);
   const currentWatchlist = watchlists.find((list) => list.id === activeWatchlist) ?? watchlists[0];
   const marketScope = routeAssetType[route];
   const scopedAssets = marketScope ? marketAssets.filter((asset) => asset.type === marketScope) : marketAssets;
-  const searchMatches = useMemo(() => fuzzySearchAssets(query, marketAssets).slice(0, 7), [query, marketAssets]);
+  const localSearchMatches = useMemo(
+    () =>
+      fuzzySearchAssets(query, marketAssets)
+        .slice(0, 7)
+        .map<SearchResult>((asset) => ({
+          symbol: asset.symbol,
+          name: asset.name,
+          type: asset.type,
+          exchange: asset.exchange,
+          provider: "Demo Fixture Provider",
+          dataStatus: asset.meta.dataStatus
+        })),
+    [query, marketAssets]
+  );
+  const searchMatches = useMemo(() => {
+    const rows = new Map<string, SearchResult>();
+    searchResults.forEach((result) => rows.set(result.symbol, result));
+    localSearchMatches.forEach((result) => {
+      if (!rows.has(result.symbol)) rows.set(result.symbol, result);
+    });
+    return [...rows.values()].slice(0, 10);
+  }, [localSearchMatches, searchResults]);
   const glossaryMatches = useMemo(() => searchGlossary(query).slice(0, 18), [query]);
   const scenario = calculateScenario({
     amount: scenarioAmount,
@@ -289,7 +332,33 @@ export default function App() {
 
   useEffect(() => {
     const saved = localStorage.getItem("msd-recent-searches");
-    if (saved) setRecentSearches(JSON.parse(saved) as string[]);
+    if (saved) {
+      try {
+        setRecentSearches(JSON.parse(saved) as string[]);
+      } catch {
+        localStorage.removeItem("msd-recent-searches");
+      }
+    }
+    const savedWatchlists = localStorage.getItem("msd-watchlists");
+    if (savedWatchlists) {
+      try {
+        const parsed = JSON.parse(savedWatchlists) as Watchlist[];
+        if (parsed.length) setWatchlists(parsed);
+      } catch {
+        localStorage.removeItem("msd-watchlists");
+      }
+    }
+    const savedActiveWatchlist = localStorage.getItem("msd-active-watchlist");
+    if (savedActiveWatchlist) setActiveWatchlist(savedActiveWatchlist);
+    const savedAlerts = localStorage.getItem("msd-alert-rules");
+    if (savedAlerts) {
+      try {
+        const parsed = JSON.parse(savedAlerts) as AlertRule[];
+        if (parsed.length) setAlertRules(parsed);
+      } catch {
+        localStorage.removeItem("msd-alert-rules");
+      }
+    }
   }, []);
 
   useEffect(() => {
@@ -297,7 +366,70 @@ export default function App() {
   }, [recentSearches]);
 
   useEffect(() => {
+    localStorage.setItem("msd-watchlists", JSON.stringify(watchlists));
+  }, [watchlists]);
+
+  useEffect(() => {
+    localStorage.setItem("msd-active-watchlist", activeWatchlist);
+  }, [activeWatchlist]);
+
+  useEffect(() => {
+    localStorage.setItem("msd-alert-rules", JSON.stringify(alertRules));
+  }, [alertRules]);
+
+  useEffect(() => {
     setActiveSuggestion(0);
+  }, [query]);
+
+  useEffect(() => {
+    setActiveSuggestion((value) => Math.min(value, Math.max(searchMatches.length - 1, 0)));
+  }, [searchMatches.length]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const state = parseRoutePath(window.location.pathname);
+      if (state.invalid) return;
+      setRoute(state.route);
+      if (state.selectedSymbol) setSelectedSymbol(state.selectedSymbol);
+      setMobileMenuOpen(false);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    const trimmed = query.trim();
+    if (!trimmed) {
+      setSearchResults([]);
+      setSearchLoading(false);
+      setSearchError("");
+      return undefined;
+    }
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      setSearchLoading(true);
+      fetch(`/api/search?q=${encodeURIComponent(trimmed)}`, { signal: controller.signal })
+        .then(async (response) => {
+          if (!response.ok) throw new Error("Search API failed");
+          return response.json() as Promise<{ results: SearchResult[] }>;
+        })
+        .then((payload) => {
+          setSearchResults(payload.results ?? []);
+          setSearchError("");
+        })
+        .catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === "AbortError") return;
+          setSearchResults([]);
+          setSearchError("Provider search unavailable. Showing local fallback results.");
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setSearchLoading(false);
+        });
+    }, 300);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [query]);
 
   useEffect(() => {
@@ -379,30 +511,77 @@ export default function App() {
     });
   }, []);
 
-  const openRoute = (id: RouteId) => {
+  const navigate = (id: RouteId, symbol?: string, type?: AssetType) => {
     setRoute(id);
+    if (symbol) setSelectedSymbol(symbol);
     setMobileMenuOpen(false);
+    const nextPath = pathForRoute(id, symbol, type);
+    if (typeof window !== "undefined" && window.location.pathname !== nextPath) {
+      window.history.pushState({}, "", nextPath);
+    }
   };
 
-  const openAsset = (symbol: string) => {
+  const openRoute = (id: RouteId) => {
+    navigate(id);
+  };
+
+  const openAsset = (symbol: string, replaceHistory = false) => {
     const asset = marketAssets.find((item) => item.symbol === symbol);
     if (!asset) {
       setToast("Asset not found. Use search suggestions or return to search.");
       return;
     }
     setSelectedSymbol(symbol);
-    setRoute(asset.type === "stock" ? "stocks" : asset.type === "crypto" ? "crypto" : asset.type === "etf" ? "etfs" : "indexes");
+    const nextRoute = asset.type === "stock" ? "stocks" : asset.type === "crypto" ? "crypto" : asset.type === "etf" ? "etfs" : "indexes";
+    setRoute(nextRoute);
     setQuery("");
     setSearchOpen(false);
     setRecentSearches((current) => [symbol, ...current.filter((item) => item !== symbol)].slice(0, 6));
     setToast(`${symbol} opened with stored ${asset.meta.dataStatus} data.`);
+    const nextPath = pathForAsset(asset.type, symbol);
+    if (typeof window !== "undefined" && window.location.pathname !== nextPath) {
+      if (replaceHistory) window.history.replaceState({}, "", nextPath);
+      else window.history.pushState({}, "", nextPath);
+    }
     void loadAssetHistory(asset);
+  };
+
+  const openSearchResult = async (result: SearchResult) => {
+    const known = marketAssets.find((asset) => asset.symbol === result.symbol);
+    const endpoint =
+      result.type === "crypto"
+        ? `/api/crypto/quote?id=${encodeURIComponent(cryptoApiId(result.symbol))}`
+        : `/api/quote?symbol=${encodeURIComponent(result.symbol)}`;
+    try {
+      const response = await fetch(endpoint);
+      if (!response.ok) {
+        setToast(`Asset not found: ${result.symbol}. The app did not substitute another ticker.`);
+        return;
+      }
+      const payload = (await response.json()) as { quote: ApiQuote };
+      const enriched = quoteToAsset(payload.quote, known);
+      setMarketAssets((assets) => {
+        const exists = assets.some((asset) => asset.symbol === enriched.symbol);
+        return exists ? assets.map((asset) => (asset.symbol === enriched.symbol ? { ...asset, ...enriched } : asset)) : [enriched, ...assets];
+      });
+      setSelectedSymbol(enriched.symbol);
+      setRoute(enriched.type === "crypto" ? "crypto" : enriched.type === "etf" ? "etfs" : enriched.type === "index" ? "indexes" : "stocks");
+      setQuery("");
+      setSearchOpen(false);
+      setRecentSearches((current) => [enriched.symbol, ...current.filter((item) => item !== enriched.symbol)].slice(0, 6));
+      const nextPath = pathForAsset(enriched.type, enriched.symbol);
+      if (typeof window !== "undefined" && window.location.pathname !== nextPath) window.history.pushState({}, "", nextPath);
+      setToast(`${enriched.symbol} opened from provider search. Quote loaded before the page changed.`);
+      void loadAssetHistory(enriched);
+    } catch {
+      setToast("Search selection failed safely. No provider error details were exposed.");
+    }
   };
 
   const handleSearchSubmit = (event: FormEvent) => {
     event.preventDefault();
-    if (searchMatches[0]) openAsset(searchMatches[0].symbol);
-    else setToast("Asset not found. Suggested matches appear when the search matches a supported asset.");
+    if (searchMatches[0]) void openSearchResult(searchMatches[0]);
+    else setToast("Asset not found. The app did not substitute another ticker.");
   };
 
   const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
@@ -416,17 +595,24 @@ export default function App() {
     }
     if (event.key === "Enter" && searchOpen && searchMatches[activeSuggestion]) {
       event.preventDefault();
-      openAsset(searchMatches[activeSuggestion].symbol);
+      void openSearchResult(searchMatches[activeSuggestion]);
     }
     if (event.key === "Escape") setSearchOpen(false);
   };
 
   const refreshData = async () => {
+    const now = Date.now();
+    if (refreshing || now < refreshReadyAt.current) {
+      setToast("Manual refresh is cooling down to avoid duplicate provider requests.");
+      return;
+    }
+    refreshReadyAt.current = now + 20_000;
     setRefreshing(true);
     try {
       const response = await fetch("/api/refresh", { method: "POST" });
-      const payload = (await response.json()) as { status: string; lastUpdated: string; message: string };
-      await loadMarkets(true);
+      if (!response.ok) throw new Error("Refresh failed");
+      const payload = (await response.json()) as { status: string; lastUpdated: string; message: string; market: MarketPayload };
+      if (payload.market) applyMarketPayload(payload.market);
       setLastRefresh(payload.lastUpdated);
       setToast(payload.message);
     } catch {
@@ -476,8 +662,8 @@ export default function App() {
     <Sidebar
       route={route}
       adminMode={adminMode}
+      runtimeStatus={runtimeStatus}
       onRoute={openRoute}
-      onAdminMode={setAdminMode}
       onClose={() => setMobileMenuOpen(false)}
     />
   );
@@ -507,12 +693,14 @@ export default function App() {
             matches={searchMatches}
             recentSearches={recentSearches}
             activeSuggestion={activeSuggestion}
+            loading={searchLoading}
+            error={searchError}
             searchRef={searchRef}
             onQuery={setQuery}
             onOpen={setSearchOpen}
             onSubmit={handleSearchSubmit}
             onKeyDown={handleSearchKeyDown}
-            onAsset={openAsset}
+            onAsset={(result) => void openSearchResult(result)}
           />
           <div className="top-actions">
             <button className="ghost-button" type="button" onClick={refreshData} disabled={refreshing}>
@@ -546,7 +734,8 @@ export default function App() {
             runtimeStatus={runtimeStatus}
           />
         ) : null}
-        {["stocks", "crypto", "etfs", "indexes"].includes(route) ? (
+        {selectedRouteMissing ? <AssetNotFoundPage symbol={selectedSymbol} onRoute={openRoute} /> : null}
+        {["stocks", "crypto", "etfs", "indexes"].includes(route) && !selectedRouteMissing ? (
           <AssetDetail asset={selectedAsset} assets={scopedAssets} news={marketNews} experience={experience} onOpen={openAsset} onWatch={toggleWatchlistAsset} />
         ) : null}
         {route === "news" ? <NewsDesk news={marketNews} onOpen={openAsset} /> : null}
@@ -584,8 +773,12 @@ export default function App() {
             onRename={(id, name) => setWatchlists((lists) => lists.map((list) => (list.id === id ? { ...list, name } : list)))}
             onNotes={(id, notes) => setWatchlists((lists) => lists.map((list) => (list.id === id ? { ...list, notes } : list)))}
             onDelete={(id) => {
-              setWatchlists((lists) => lists.filter((list) => list.id !== id));
-              setActiveWatchlist("default");
+              setWatchlists((lists) => {
+                const remaining = lists.filter((list) => list.id !== id);
+                if (!remaining.length) return defaultWatchlists;
+                setActiveWatchlist(remaining.some((list) => list.id === "default") ? "default" : remaining[0].id);
+                return remaining;
+              });
             }}
             onOpen={openAsset}
             onWatch={toggleWatchlistAsset}
@@ -596,7 +789,7 @@ export default function App() {
         {route === "learn" ? <LearnPage terms={glossaryMatches.length ? glossaryMatches : glossaryTerms.slice(0, 18)} beginner={experience === "beginner"} /> : null}
         {route === "definitions" ? <DefinitionsPage terms={glossaryMatches.length ? glossaryMatches : glossaryTerms} /> : null}
         {route === "profile" ? <ProfilePage experience={experience} theme={theme} /> : null}
-        {route === "settings" ? <SettingsPage adminMode={adminMode} setAdminMode={setAdminMode} /> : null}
+        {route === "settings" ? <SettingsPage /> : null}
         {route === "status" ? <SystemStatus lastRefresh={lastRefresh} providerRows={providerRows} runtimeStatus={runtimeStatus} /> : null}
         {["admin", "backend", "quality", "api-usage", "audit"].includes(route) ? <AdminPage route={route} runtimeStatus={runtimeStatus} /> : null}
 
@@ -611,14 +804,14 @@ export default function App() {
 function Sidebar({
   route,
   adminMode,
+  runtimeStatus,
   onRoute,
-  onAdminMode,
   onClose
 }: {
   route: RouteId;
   adminMode: boolean;
+  runtimeStatus: RuntimeStatus | null;
   onRoute: (id: RouteId) => void;
-  onAdminMode: (enabled: boolean) => void;
   onClose: () => void;
 }) {
   return (
@@ -656,13 +849,15 @@ function Sidebar({
           );
         })}
       </nav>
-      <label className="toggle admin-toggle">
-        <input type="checkbox" checked={adminMode} onChange={(event) => onAdminMode(event.target.checked)} />
-        Show admin tools
-      </label>
       <div className="status-card">
-        <Badge tone="warning">Demo Mode</Badge>
-        <p>Provider keys are missing. Demo fixtures are fixed, timestamped, and never presented as live prices.</p>
+        <Badge tone={runtimeStatus?.mode === "live" ? "positive" : runtimeStatus?.mode === "unavailable" ? "negative" : "warning"}>
+          {runtimeStatus?.applicationMode ?? "Checking"}
+        </Badge>
+        <p>
+          {runtimeStatus
+            ? `Stocks: ${runtimeStatus.stockMarketStatus}. Crypto: ${runtimeStatus.cryptoMarketStatus}. Cron: backend ingestion scheduled daily at 09:00 UTC.`
+            : "Runtime status is loading from the internal API."}
+        </p>
       </div>
     </div>
   );
@@ -674,6 +869,8 @@ function GlobalSearch({
   matches,
   recentSearches,
   activeSuggestion,
+  loading,
+  error,
   searchRef,
   onQuery,
   onOpen,
@@ -683,16 +880,19 @@ function GlobalSearch({
 }: {
   query: string;
   searchOpen: boolean;
-  matches: Asset[];
+  matches: SearchResult[];
   recentSearches: string[];
   activeSuggestion: number;
+  loading: boolean;
+  error: string;
   searchRef: React.RefObject<HTMLDivElement | null>;
   onQuery: (value: string) => void;
   onOpen: (open: boolean) => void;
   onSubmit: (event: FormEvent) => void;
   onKeyDown: (event: KeyboardEvent<HTMLInputElement>) => void;
-  onAsset: (symbol: string) => void;
+  onAsset: (result: SearchResult) => void;
 }) {
+  const activeId = matches[activeSuggestion] ? `asset-search-option-${matches[activeSuggestion].symbol.replace(/[^A-Za-z0-9_-]/g, "-")}` : undefined;
   return (
     <div className="search-shell" ref={searchRef}>
       <form className="search" onSubmit={onSubmit} role="search">
@@ -705,6 +905,7 @@ function GlobalSearch({
           role="combobox"
           aria-expanded={searchOpen}
           aria-controls="asset-search-results"
+          aria-activedescendant={activeId}
           aria-autocomplete="list"
           value={query}
           onChange={(event) => {
@@ -719,33 +920,52 @@ function GlobalSearch({
       </form>
       {searchOpen ? (
         <div className="search-popover" id="asset-search-results" role="listbox">
-          {query && !matches.length ? (
+          {loading ? <div className="empty-search" role="status">Searching providers...</div> : null}
+          {error ? <div className="empty-search warning" role="status">{error}</div> : null}
+          {query && !loading && !matches.length ? (
             <div className="empty-search">
               <strong>Asset not found</strong>
-              <span>Try MSFT, AAPL, SPY, BTC-USD, or search from the screener.</span>
+              <span>No provider or local fallback matched this search. No substitute ticker was selected.</span>
             </div>
           ) : null}
-          {matches.map((asset, index) => (
+          {matches.map((result, index) => (
             <button
-              key={asset.symbol}
+              key={`${result.provider}-${result.symbol}`}
+              id={`asset-search-option-${result.symbol.replace(/[^A-Za-z0-9_-]/g, "-")}`}
               className={index === activeSuggestion ? "search-option active" : "search-option"}
               type="button"
               role="option"
               aria-selected={index === activeSuggestion}
-              onClick={() => onAsset(asset.symbol)}
+              onClick={() => onAsset(result)}
             >
               <span>
-                <strong>{asset.symbol}</strong>
-                <small>{asset.name}</small>
+                <strong>{result.symbol}</strong>
+                <small>{result.name}</small>
               </span>
-              <Badge tone={statusSeverity(asset.meta.dataStatus)}>{asset.meta.dataStatus}</Badge>
+              <span className="search-provider">
+                <Badge tone={statusSeverity(result.dataStatus)}>{result.dataStatus}</Badge>
+                <small>{result.provider}</small>
+              </span>
             </button>
           ))}
           {!query && recentSearches.length ? (
             <div className="recent-searches">
               <span className="nav-group-title">Recent searches</span>
               {recentSearches.map((symbol) => (
-                <button type="button" className="small-button" key={symbol} onClick={() => onAsset(symbol)}>
+                <button
+                  type="button"
+                  className="small-button"
+                  key={symbol}
+                  onClick={() =>
+                    onAsset({
+                      symbol,
+                      name: symbol,
+                      type: symbol.endsWith("-USD") ? "crypto" : "stock",
+                      provider: "Demo Fixture Provider",
+                      dataStatus: "Demo"
+                    })
+                  }
+                >
                   {symbol}
                 </button>
               ))}
@@ -808,10 +1028,30 @@ function Dashboard({
   const losers = [...assets].sort((a, b) => a.changePercent - b.changePercent).slice(0, 5);
   const trending = [...assets].sort((a, b) => b.hype - a.hype).slice(0, 5);
   const unusual = [...assets].sort((a, b) => b.relativeVolume - a.relativeVolume).slice(0, 5);
+  const ranked = [...assets]
+    .filter((asset) => asset.price > 0 && Number.isFinite(asset.confidence) && Number.isFinite(asset.risk))
+    .map((asset) => ({
+      asset,
+      score:
+        asset.confidence * 0.28 +
+        (100 - asset.risk) * 0.24 +
+        Math.max(-20, Math.min(20, asset.changePercent)) * 0.9 +
+        Math.min(asset.relativeVolume, 3) * 7 +
+        (asset.meta.dataStatus === "Demo" ? -8 : 8)
+    }))
+    .sort((a, b) => b.score - a.score);
+  const bestSetup = ranked[0]?.asset ?? assets[0] ?? demoAssets[0];
+  const bestInputs = [
+    `confidence ${bestSetup.confidence}`,
+    `risk ${bestSetup.risk}`,
+    `momentum ${percent(bestSetup.changePercent)}`,
+    `relative volume ${bestSetup.relativeVolume || "unavailable"}`,
+    `data ${bestSetup.meta.dataStatus}`
+  ];
   const watchAssets = assets.filter((asset) => watchlist.symbols.includes(asset.symbol));
   const indexes = assets.filter((asset) => asset.type === "index" || asset.type === "etf").slice(0, 5);
   const liveCount = assets.filter((asset) => asset.meta.dataStatus === "Live" || asset.meta.dataStatus === "Delayed").length;
-  const providerLabel = runtimeStatus?.mode === "demo" ? "Demo fallback" : runtimeStatus?.mode === "mixed" ? "Mixed provider data" : "Live providers";
+  const providerLabel = runtimeStatus?.applicationMode ?? "Checking";
   const easternTime = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "numeric",
@@ -828,12 +1068,12 @@ function Dashboard({
           <span className="eyebrow">Market status and data freshness</span>
           <h2>Market status: {runtimeStatus?.marketStatus ?? "checking"}</h2>
           <p>
-            Eastern Time {easternTime} | Last successful update {formatDateTime(lastRefresh)} | Source: {providerLabel}
+            Eastern Time {easternTime} | Last successful update {formatDateTime(lastRefresh)} | Mode: {providerLabel}
           </p>
         </div>
         <div className="status-actions">
           <Badge tone={liveCount ? "positive" : "warning"}>{liveCount ? `${liveCount} provider-backed assets` : "Demo Data"}</Badge>
-          <span>Next automatic refresh: Vercel cron configured in vercel.json</span>
+          <span>{runtimeStatus?.cronSchedule.description ?? "Backend ingestion scheduled daily at 09:00 UTC."}</span>
           <button className="primary-button" type="button" onClick={onRefresh} disabled={refreshing}>
             <RefreshCw size={16} /> {refreshing ? "Refreshing" : "Manual refresh"}
           </button>
@@ -842,10 +1082,10 @@ function Dashboard({
       <div className="dashboard-grid">
         <DashboardPanel title={`Watchlist: ${watchlist.name}`} assets={watchAssets} onOpen={onOpen} onWatch={onWatch} />
         <DashboardPanel title="Major market indexes" assets={indexes} onOpen={onOpen} onWatch={onWatch} />
-        <DashboardPanel title="Top gainers" assets={gainers} onOpen={onOpen} onWatch={onWatch} />
-        <DashboardPanel title="Top losers" assets={losers} onOpen={onOpen} onWatch={onWatch} />
+        <DashboardPanel title={`Top gainers (${assets.length} analyzed, ${formatDateTime(lastRefresh, false)})`} assets={gainers} onOpen={onOpen} onWatch={onWatch} />
+        <DashboardPanel title={`Top losers (${assets.length} analyzed, ${formatDateTime(lastRefresh, false)})`} assets={losers} onOpen={onOpen} onWatch={onWatch} />
         <DashboardPanel title="Trending assets" assets={trending} onOpen={onOpen} onWatch={onWatch} />
-        <DashboardPanel title="Unusual volume" assets={unusual} onOpen={onOpen} onWatch={onWatch} />
+        <DashboardPanel title={`Unusual volume (${assets.filter((asset) => asset.relativeVolume > 0).length} with volume data)`} assets={unusual} onOpen={onOpen} onWatch={onWatch} />
         <section className="panel">
           <h2>Market heat map</h2>
           <div className="heat-map">
@@ -863,7 +1103,8 @@ function Dashboard({
         </section>
         <section className="panel">
           <h2>Best current research setup</h2>
-          <AssetRow asset={assets[0] ?? demoAssets[0]} onOpen={onOpen} onWatch={onWatch} />
+          <AssetRow asset={bestSetup} onOpen={onOpen} onWatch={onWatch} />
+          <p>Ranked from {ranked.length} assets using {bestInputs.join(", ")}. {bestSetup.meta.dataStatus === "Demo" ? "This ranking includes demo metrics and is labeled accordingly." : "Provider-backed price data was included where available."}</p>
         </section>
         <section className="panel">
           <h2>Market sentiment</h2>
@@ -917,6 +1158,9 @@ function AssetDetail({
   const sentimentScore = Math.round((asset.sentiment + 1) * 50);
   const dataQuality = asset.meta.dataStatus === "Demo" ? 72 : 88;
   const momentum = asset.price > asset.sma50 ? "Positive trend alignment" : "Weak trend alignment";
+  const priceSource = `${asset.meta.provider} - ${asset.meta.dataStatus}`;
+  const calculatedSource = asset.meta.dataStatus === "Demo" ? "Demo model" : "Calculated from stored candles; timing not guaranteed";
+  const volumeSource = asset.volume ? priceSource : "Unavailable from active quote provider";
   return (
     <section className="page">
       <div className="asset-header">
@@ -957,9 +1201,10 @@ function AssetDetail({
           <div className="stat-grid">
             <Stat label="Open" value={currency(asset.open)} />
             <Stat label="Previous close" value={currency(asset.previousClose)} />
-            <Stat label="Volume" value={asset.volume ? compactNumber(asset.volume) : "Not available"} />
-            <Stat label="Average volume" value={compactNumber(asset.averageVolume)} />
-            <Stat label="Relative volume" value={asset.relativeVolume || "Not available"} />
+            <Stat label="Price provenance" value={priceSource} />
+            <Stat label="Volume" value={asset.volume ? compactNumber(asset.volume) : "Unavailable"} note={volumeSource} />
+            <Stat label="Average volume" value={asset.averageVolume ? compactNumber(asset.averageVolume) : "Unavailable"} note={asset.meta.dataStatus === "Demo" ? "Demo fixture" : "Historical/demo fallback unless provider supplies it"} />
+            <Stat label="Relative volume" value={asset.relativeVolume || "Unavailable"} note={volumeSource} />
             <Stat label="Market capitalization" value={asset.marketCap ? compactNumber(asset.marketCap) : "Not available"} />
             <Stat label="52-week high" value={currency(asset.yearHigh)} />
             <Stat label="52-week low" value={currency(asset.yearLow)} />
@@ -967,10 +1212,10 @@ function AssetDetail({
             <Stat label="EPS" value="Not available" note="Provider field required." />
             <Stat label="Dividend yield" value={asset.dividendYield !== undefined ? `${asset.dividendYield}%` : "Not available"} />
             <Stat label="Volatility" value={`${asset.volatility}/100`} />
-            <Stat label="RSI" value={asset.rsi} />
-            <Stat label="Support" value={currency(asset.support)} />
-            <Stat label="Resistance" value={currency(asset.resistance)} />
-            <Stat label="Momentum" value={momentum} />
+            <Stat label="RSI" value={asset.rsi} note={calculatedSource} />
+            <Stat label="Support" value={currency(asset.support)} note={calculatedSource} />
+            <Stat label="Resistance" value={currency(asset.resistance)} note={calculatedSource} />
+            <Stat label="Momentum" value={momentum} note={calculatedSource} />
           </div>
         </section>
         <section className="panel span-4">
@@ -982,6 +1227,7 @@ function AssetDetail({
             <Meter label="Risk" value={asset.risk} danger />
             <Meter label="Confidence" value={asset.confidence} />
             <Meter label="Data quality" value={dataQuality} />
+            <small>Risk, sentiment, and confidence are demo/calculated research metrics unless a configured model/provider writes those fields.</small>
           </div>
         </section>
       </div>
@@ -1202,9 +1448,10 @@ function NewsList({ news, onOpen, compact = false, symbols }: { news: NewsItem[]
         <article className="news-card" key={item.id}>
           <div>
             <Badge tone={item.tone === "Positive" ? "positive" : item.tone === "Negative" ? "negative" : "warning"}>{item.tone}</Badge>
+            <Badge tone={statusSeverity(item.dataStatus ?? "Demo")}>{item.dataStatus ?? "Demo"}</Badge>
             <h3>{item.headline}</h3>
             <p>{item.summary}</p>
-            <small>{item.source} | Published {formatDateTime(item.publishedAt)} | Impact {item.impactScore}/100 | Duplicate check: unique demo story</small>
+            <small>{item.source} | Provider {item.provider ?? item.source} | Published {formatDateTime(item.publishedAt)} | Impact {item.impactScore}/100 | Duplicate check: headline/source</small>
           </div>
           <div className="button-row">
             {item.relatedSymbols.map((symbol) => (
@@ -1315,7 +1562,7 @@ function WatchlistsPage({
   onWatch,
   onExport
 }: {
-  watchlists: Array<{ id: string; name: string; symbols: string[]; notes: string }>;
+  watchlists: Watchlist[];
   activeWatchlist: string;
   sort: SortKey;
   assets: Asset[];
@@ -1375,8 +1622,8 @@ function AlertsPage({
   alertRules,
   setAlertRules
 }: {
-  alertRules: Array<{ id: string; symbol: string; type: string; value: string; enabled: boolean; demo: boolean }>;
-  setAlertRules: React.Dispatch<React.SetStateAction<Array<{ id: string; symbol: string; type: string; value: string; enabled: boolean; demo: boolean }>>>;
+  alertRules: AlertRule[];
+  setAlertRules: React.Dispatch<React.SetStateAction<AlertRule[]>>;
 }) {
   return (
     <section className="page">
@@ -1485,16 +1732,29 @@ function ProfilePage({ experience, theme }: { experience: ExperienceMode; theme:
   );
 }
 
-function SettingsPage({ adminMode, setAdminMode }: { adminMode: boolean; setAdminMode: (value: boolean) => void }) {
+function SettingsPage() {
   return (
     <section className="page">
       <PageTitle eyebrow="Settings" title="Research preferences" copy="Settings are local in Demo Mode and become database-backed after authentication is configured." />
       <section className="panel">
-        <label className="toggle big">
-          <input type="checkbox" checked={adminMode} onChange={(event) => setAdminMode(event.target.checked)} />
-          Show admin pages for local review
-        </label>
+        <Badge tone="warning">Admin access protected</Badge>
+        <p>Admin tools require Supabase Auth plus an admin role check. They are not enabled by a browser checkbox.</p>
         <p>Notification preferences, quiet hours, and saved default watchlists require signed-in database storage.</p>
+      </section>
+    </section>
+  );
+}
+
+function AssetNotFoundPage({ symbol, onRoute }: { symbol: string; onRoute: (route: RouteId) => void }) {
+  return (
+    <section className="page">
+      <PageTitle eyebrow="Not found" title={`${symbol} is not available`} copy="This asset URL is valid, but the current providers and demo fallback did not return a matching asset. No nearby ticker was substituted." />
+      <section className="panel">
+        <p>Try the global search, return to a market list, or add provider keys in Vercel to expand supported symbols.</p>
+        <div className="button-row">
+          <button className="primary-button" type="button" onClick={() => onRoute("screener")}>Open screener</button>
+          <button className="ghost-button" type="button" onClick={() => onRoute("dashboard")}>Back to dashboard</button>
+        </div>
       </section>
     </section>
   );
@@ -1516,9 +1776,12 @@ function SystemStatus({
       <section className="panel">
         <div className="stat-grid">
           <Stat label="Runtime mode" value={runtimeStatus?.mode ?? "checking"} />
-          <Stat label="Market status" value={runtimeStatus?.marketStatus ?? "checking"} />
+          <Stat label="Stock market" value={runtimeStatus?.stockMarketStatus ?? "checking"} />
+          <Stat label="Crypto market" value={runtimeStatus?.cryptoMarketStatus ?? "checking"} />
           <Stat label="Supabase public config" value={runtimeStatus?.supabasePublicConfigured ? "Configured" : "Missing"} />
           <Stat label="Supabase server config" value={runtimeStatus?.supabaseServerConfigured ? "Configured" : "Missing"} />
+          <Stat label="Cron" value={runtimeStatus?.cronSchedule.description ?? "checking"} />
+          <Stat label="Cache backend" value={runtimeStatus?.cacheBackend.kind ?? "checking"} note={runtimeStatus?.cacheBackend.note} />
         </div>
       </section>
       <div className="grid">
@@ -1527,10 +1790,12 @@ function SystemStatus({
             <h2>{item.name}</h2>
             <Badge tone={item.configured ? "positive" : "warning"}>{item.configured ? "Configured" : "Missing key"}</Badge>
             <p>{item.status}</p>
-            <small>Supports: {item.supports.join(", ")} | Server-side only: {item.serverSideOnly ? "yes" : "no"}</small>
+            <small>
+              Supports: {item.supports.join(", ")} | Freshness: {item.dataFreshness} | Fallback active: {item.fallbackActive ? "yes" : "no"} | Rate limit: {item.rateLimitState}
+            </small>
           </section>
         ))}
-        {providerRows.map((item) => (
+        {!runtimeProviders.length ? providerRows.map((item) => (
           <section className="panel span-4" key={item.provider}>
             <h2>{item.provider}</h2>
             <Badge tone={item.marketData === "Healthy" ? "positive" : "warning"}>Market {item.marketData}</Badge>
@@ -1538,13 +1803,27 @@ function SystemStatus({
             <p>{item.notes}</p>
             <small>Last successful update: {formatDateTime(lastRefresh)} | Delay: Demo snapshot | API latency: not measured</small>
           </section>
-        ))}
+        )) : null}
       </div>
     </section>
   );
 }
 
 function AdminPage({ route, runtimeStatus }: { route: RouteId; runtimeStatus: RuntimeStatus | null }) {
+  if (!runtimeStatus?.supabasePublicConfigured || !runtimeStatus?.supabaseServerConfigured) {
+    return (
+      <section className="page">
+        <PageTitle eyebrow="Protected Admin" title="Admin access unavailable" copy="Admin tools require Supabase Auth, a profile role of admin, and server-side role checks. A browser checkbox cannot unlock this area." />
+        <section className="panel">
+          <div className="stat-grid">
+            <Stat label="Auth configured" value={runtimeStatus?.supabasePublicConfigured ? "Configured" : "Missing"} />
+            <Stat label="Server role check" value={runtimeStatus?.supabaseServerConfigured ? "Configured" : "Missing"} />
+            <Stat label="Admin API" value="/api/admin/diagnostics returns 401 until an admin session is supplied" />
+          </div>
+        </section>
+      </section>
+    );
+  }
   const rows = [
     ["Provider health", runtimeStatus ? `${runtimeStatus.mode} mode with ${runtimeStatus.providers.filter((provider) => provider.configured).length} configured providers.` : "Checking runtime provider status."],
     ["API usage", "Browser calls only internal Next.js API routes; provider keys stay server-side."],

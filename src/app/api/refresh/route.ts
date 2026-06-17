@@ -18,6 +18,7 @@ export async function POST() {
         : "Refresh completed with Demo fallback because stock provider keys are missing or unavailable.",
       providerStatus: status.providers,
       cache: snapshot.cache,
+      market: snapshot,
       dataStatusCounts: snapshot.assets.reduce<Record<string, number>>((counts, asset) => {
         counts[asset.meta.dataStatus] = (counts[asset.meta.dataStatus] ?? 0) + 1;
         return counts;

@@ -6,7 +6,7 @@ describe("Market Signal Deck app", () => {
   it("renders the dashboard and demo disclaimer", () => {
     render(<App />);
     expect(screen.getByText("Market command center")).toBeInTheDocument();
-    expect(screen.getAllByText("Demo Mode").length).toBeGreaterThan(0);
+    expect(screen.getByText(/Demo Mode active/)).toBeInTheDocument();
     expect(screen.getByText(/Educational market research only/)).toBeInTheDocument();
   });
 });

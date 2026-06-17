@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getRuntimeStatus } from "../../../services/providerRegistry";
+import { runSupabaseIngestion } from "../../../services/ingestion";
 
 export const dynamic = "force-dynamic";
 
@@ -10,20 +11,31 @@ const authorize = (request: Request) => {
   return auth === `Bearer ${expectedSecret}`;
 };
 
-const runIngest = (request: Request) => {
+const runIngest = async (request: Request) => {
   if (!authorize(request)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
   const status = getRuntimeStatus();
+  const result = await runSupabaseIngestion();
   const payload = {
     event: "market_ingest_checked",
     at: new Date().toISOString(),
     mode: status.demoMode ? "demo" : "provider-ready",
-    wroteRemoteData: false,
-    message: status.demoMode
-      ? "Vercel cron reached the ingestion route. Demo Mode stayed active because provider keys are missing."
-      : "Vercel cron reached the ingestion route. Provider adapters can safely run server-side from here.",
+    wroteRemoteData: result.wroteRemoteData,
+    runId: result.runId,
+    recordsWritten: {
+      assets: result.assetsUpserted,
+      quotes: result.quotesUpserted,
+      candles: result.candlesUpserted,
+      providerStatus: result.providerStatusUpserted
+    },
+    failures: result.failures,
+    message: result.wroteRemoteData
+      ? `Supabase ingestion completed with ${result.assetsUpserted} assets, ${result.quotesUpserted} quotes, and ${result.candlesUpserted} candles written.`
+      : status.supabaseServerConfigured
+        ? "Ingestion ran but no remote records were written. Check provider and Supabase job failures."
+        : "Vercel cron reached the ingestion route. Supabase service credentials are missing, so no remote records were written.",
     status
   };
 
@@ -33,7 +45,9 @@ const runIngest = (request: Request) => {
       at: payload.at,
       mode: payload.mode,
       providerCount: status.providers.filter((provider) => provider.configured).length,
-      supabaseServerConfigured: status.supabaseServerConfigured
+      supabaseServerConfigured: status.supabaseServerConfigured,
+      recordsWritten: payload.recordsWritten,
+      failureCount: result.failures.length
     })
   );
 

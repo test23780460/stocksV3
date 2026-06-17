@@ -5,6 +5,7 @@ import { Maximize2, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { currency, formatDateTime, percent } from "../lib/format";
 import type { Asset, Bar } from "../types";
+import type { HistoryEnvelope } from "../services/marketData";
 
 const ranges = ["1D", "5D", "1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"] as const;
 export type ChartRange = (typeof ranges)[number];
@@ -13,17 +14,37 @@ type PriceSeries = ISeriesApi<"Area"> | ISeriesApi<"Candlestick">;
 
 const sliceBars = (bars: Bar[], range: ChartRange) => {
   const sizes: Record<ChartRange, number> = {
-    "1D": 1,
+    "1D": 2,
     "5D": 5,
     "1M": 22,
     "3M": 66,
     "6M": 132,
-    YTD: 130,
+    YTD: 180,
     "1Y": 252,
-    "5Y": 260,
+    "5Y": 1260,
     MAX: bars.length
   };
   return bars.slice(-Math.min(sizes[range], bars.length));
+};
+
+const rangeInterval: Record<ChartRange, string> = {
+  "1D": "5m",
+  "5D": "30m",
+  "1M": "1h",
+  "3M": "1D",
+  "6M": "1D",
+  YTD: "1D",
+  "1Y": "1D",
+  "5Y": "1W",
+  MAX: "1M"
+};
+
+const cryptoApiId = (symbol: string) => {
+  const normalized = symbol.toUpperCase().replace("-USD", "");
+  if (normalized === "BTC" || normalized === "BTCUSD") return "bitcoin";
+  if (normalized === "ETH" || normalized === "ETHUSD") return "ethereum";
+  if (normalized === "SOL" || normalized === "SOLUSD") return "solana";
+  return symbol.toLowerCase();
 };
 
 interface Props {
@@ -37,14 +58,71 @@ export function MarketChart({ asset, advanced, autoColor }: Props) {
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<PriceSeries | null>(null);
   const volumeRef = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const historyCache = useRef(new Map<string, HistoryEnvelope>());
   const [range, setRange] = useState<ChartRange>("1Y");
   const [chartType, setChartType] = useState<ChartType>("line");
+  const [history, setHistory] = useState<HistoryEnvelope | null>(null);
+  const [loadingRange, setLoadingRange] = useState(false);
+  const [rangeError, setRangeError] = useState("");
   const [hover, setHover] = useState<{ price: number; time: string } | null>(null);
-  const visibleBars = useMemo(() => sliceBars(asset.bars, range), [asset.bars, range]);
+  const activeBars = history?.candles?.length ? history.candles : sliceBars(asset.bars, range);
+  const visibleBars = useMemo(() => activeBars, [activeBars]);
+  const dataShape = history?.dataShape ?? "ohlc";
   const start = visibleBars[0];
   const end = visibleBars[visibleBars.length - 1];
   const rangeChange = start && end ? ((end.close - start.close) / start.close) * 100 : 0;
   const chartColor = !autoColor ? "#22d3ee" : rangeChange >= 0 ? "#22c55e" : "#fb7185";
+  const returnedPoints = history?.actualRange.points ?? visibleBars.length;
+
+  useEffect(() => {
+    setHistory(null);
+    setRangeError("");
+  }, [asset.symbol]);
+
+  useEffect(() => {
+    if (dataShape === "price-series" && chartType === "candlestick") {
+      setChartType("line");
+    }
+  }, [chartType, dataShape]);
+
+  useEffect(() => {
+    const interval = rangeInterval[range];
+    const cacheKey = `${asset.symbol}:${range}:${interval}`;
+    const cached = historyCache.current.get(cacheKey);
+    if (cached) {
+      setHistory(cached);
+      setRangeError("");
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    setLoadingRange(true);
+    setRangeError("");
+    const endpoint =
+      asset.type === "crypto"
+        ? `/api/crypto/history?id=${encodeURIComponent(cryptoApiId(asset.symbol))}&range=${range}&interval=${interval}`
+        : `/api/history?symbol=${encodeURIComponent(asset.symbol)}&range=${range}&interval=${interval}`;
+
+    fetch(endpoint, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error("History API failed");
+        return response.json() as Promise<HistoryEnvelope>;
+      })
+      .then((payload) => {
+        historyCache.current.set(cacheKey, payload);
+        setHistory(payload);
+      })
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setHistory(null);
+        setRangeError("Range-specific history unavailable. Showing the best stored fallback series.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingRange(false);
+      });
+
+    return () => controller.abort();
+  }, [asset.symbol, asset.type, range]);
 
   useEffect(() => {
     if (!containerRef.current) return undefined;
@@ -165,8 +243,9 @@ export function MarketChart({ asset, advanced, autoColor }: Props) {
           <div className="eyebrow">Primary Chart</div>
           <h2>{asset.symbol} research chart</h2>
           <p>
-            {start?.time} to {end?.time} | {range} change{" "}
+            {start?.time} to {end?.time} | Returned period change{" "}
             <span className={rangeChange >= 0 ? "positive" : "negative"}>{percent(rangeChange)}</span>
+            {" "}({range} request, {returnedPoints} points)
           </p>
         </div>
         <div className="chart-price">
@@ -177,7 +256,7 @@ export function MarketChart({ asset, advanced, autoColor }: Props) {
       <div className="timeframe-row" aria-label="Chart timeframe controls">
         <div className="segmented-control" role="group" aria-label="Chart display type">
           {(["line", "candlestick"] as const).map((type) => (
-            <button key={type} className={chartType === type ? "chip active" : "chip"} type="button" onClick={() => setChartType(type)}>
+            <button key={type} className={chartType === type ? "chip active" : "chip"} type="button" onClick={() => setChartType(type)} disabled={type === "candlestick" && dataShape === "price-series"}>
               {type === "line" ? "Line" : "Candles"}
             </button>
           ))}
@@ -197,9 +276,15 @@ export function MarketChart({ asset, advanced, autoColor }: Props) {
       <div className="chart-meta">
         <span>Last updated {formatDateTime(asset.meta.lastUpdated)}</span>
         <span>{asset.meta.marketStatus}</span>
-        <span>{asset.meta.dataStatus}</span>
-        <span>Provider: {asset.meta.provider}</span>
+        <span>{history?.dataStatus ?? asset.meta.dataStatus}</span>
+        <span>Provider: {history?.provider ?? asset.meta.provider}</span>
+        <span>Interval: {history?.interval ?? rangeInterval[range]}</span>
+        <span>{loadingRange ? "Loading range..." : history?.cache.hit ? "Cached range" : "Fresh range request"}</span>
       </div>
+      {dataShape === "price-series" ? (
+        <p className="chart-note">The active crypto provider returned a price series, not true OHLC candles. Candlesticks are disabled to avoid fabricated highs and lows.</p>
+      ) : null}
+      {rangeError ? <p className="chart-note warning">{rangeError}</p> : null}
       <div ref={containerRef} className="chart-canvas" />
       {advanced ? (
         <div className="indicator-strip" aria-label="Advanced chart indicators">

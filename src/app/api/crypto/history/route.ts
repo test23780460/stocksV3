@@ -1,20 +1,23 @@
 import { NextResponse } from "next/server";
 import { getCryptoHistory, notFoundResponse, serverErrorResponse } from "../../../../services/marketData";
+import { booleanStringSchema, cryptoIdSchema, intervalSchema, parseOrBadRequest, rangeSchema } from "../../../../services/apiValidation";
 
 export const dynamic = "force-dynamic";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
-  const id = url.searchParams.get("id")?.trim();
-  const range = url.searchParams.get("range") || "1Y";
-  const refresh = url.searchParams.get("refresh") === "true";
+  const id = parseOrBadRequest(cryptoIdSchema, url.searchParams.get("id") ?? "");
+  const range = parseOrBadRequest(rangeSchema, url.searchParams.get("range") ?? "1Y");
+  const interval = parseOrBadRequest(intervalSchema, url.searchParams.get("interval") ?? "1D");
+  const refresh = parseOrBadRequest(booleanStringSchema, url.searchParams.get("refresh") ?? undefined);
 
-  if (!id) {
-    return NextResponse.json({ error: "bad_request", message: "Missing required id query parameter." }, { status: 400 });
-  }
+  if (id.error) return NextResponse.json(id.error, { status: 400 });
+  if (range.error) return NextResponse.json(range.error, { status: 400 });
+  if (interval.error) return NextResponse.json(interval.error, { status: 400 });
+  if (refresh.error) return NextResponse.json(refresh.error, { status: 400 });
 
   try {
-    const history = await getCryptoHistory(id, range, { refresh });
+    const history = await getCryptoHistory(id.data, range.data, { refresh: Boolean(refresh.data) });
     return NextResponse.json(history, {
       headers: {
         "Cache-Control": refresh ? "no-store" : "s-maxage=300, stale-while-revalidate=1800"

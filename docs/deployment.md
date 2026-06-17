@@ -17,7 +17,7 @@ Add public values with the `NEXT_PUBLIC_` prefix only when they are safe for bro
 
 - `NEXT_PUBLIC_SUPABASE_URL`
 - `NEXT_PUBLIC_SUPABASE_ANON_KEY`
-- `NEXT_PUBLIC_APP_URL`
+- `NEXT_PUBLIC_APP_URL=https://stocks-v111.vercel.app`
 
 Add all provider keys and service keys as private Vercel variables:
 
@@ -30,6 +30,8 @@ Add all provider keys and service keys as private Vercel variables:
 - `COINGECKO_API_KEY`
 - `NEWS_API_KEY`
 - `CRON_SECRET`
+- `MARKET_DATA_PROVIDER`
+- `NEWS_DATA_PROVIDER`
 
 ## Cron
 

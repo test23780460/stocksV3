@@ -33,7 +33,7 @@ export default function HomePage() {
           <p>Educational market research only. Nothing here is financial advice.</p>
         </section>
       </noscript>
-      <App />
+      <App initialPath="/" />
     </>
   );
 }

@@ -54,6 +54,13 @@ export interface HistoryEnvelope {
   candles: Bar[];
   provider: MarketProvider;
   dataStatus: DataStatus;
+  dataShape: "ohlc" | "price-series";
+  actualRange: {
+    start: string | null;
+    end: string | null;
+    points: number;
+  };
+  note?: string;
   generatedAt: string;
   cache: CacheInfo;
   attempts: ProviderAttempt[];
@@ -86,10 +93,23 @@ export interface MarketSnapshotEnvelope {
 }
 
 export interface RuntimeStatus {
-  mode: "live" | "mixed" | "demo";
+  mode: "live" | "mixed" | "cached" | "demo" | "unavailable";
+  applicationMode: "Live" | "Mixed" | "Cached" | "Demo" | "Unavailable";
   demoMode: boolean;
   generatedAt: string;
   marketStatus: MarketMeta["marketStatus"];
+  stockMarketStatus: Exclude<MarketMeta["marketStatus"], "Continuous">;
+  cryptoMarketStatus: "Continuous";
+  cronSchedule: {
+    path: string;
+    expression: string;
+    description: string;
+  };
+  cacheBackend: {
+    kind: "per-instance-memory";
+    durable: false;
+    note: string;
+  };
   cachePolicy: Record<string, string>;
   supabasePublicConfigured: boolean;
   supabaseServerConfigured: boolean;
@@ -100,6 +120,14 @@ export interface RuntimeStatus {
     serverSideOnly: boolean;
     status: string;
     supports: string[];
+    lastSuccessfulRequest: string | null;
+    lastFailedRequest: string | null;
+    currentError: string | null;
+    rateLimitState: "unknown" | "ok" | "limited";
+    dataFreshness: "real-time" | "near-real-time" | "delayed" | "end-of-day" | "cached" | "demo" | "unavailable" | "timing-not-guaranteed";
+    fallbackActive: boolean;
+    cacheHitRate: number | null;
+    averageResponseTimeMs: number | null;
   }>;
   requiredEnvironment: Array<{ name: string; configured: boolean; public: boolean }>;
   routes: string[];
@@ -132,14 +160,29 @@ const historyTtlMs = 900_000;
 const newsTtlMs = 900_000;
 const searchTtlMs = 86_400_000;
 
+const applicationModeLabel = (mode: RuntimeStatus["mode"]): RuntimeStatus["applicationMode"] => {
+  if (mode === "live") return "Live";
+  if (mode === "mixed") return "Mixed";
+  if (mode === "cached") return "Cached";
+  if (mode === "unavailable") return "Unavailable";
+  return "Demo";
+};
+
 const requiredEnvironment = [
+  { name: "NEXT_PUBLIC_APP_URL", public: true },
+  { name: "NEXT_PUBLIC_SUPABASE_URL", public: true },
+  { name: "NEXT_PUBLIC_SUPABASE_ANON_KEY", public: true },
+  { name: "SUPABASE_URL", public: false },
+  { name: "SUPABASE_ANON_KEY", public: false },
+  { name: "SUPABASE_SERVICE_ROLE_KEY", public: false },
   { name: "FINNHUB_API_KEY", public: false },
   { name: "TWELVE_DATA_API_KEY", public: false },
   { name: "ALPHA_VANTAGE_API_KEY", public: false },
   { name: "COINGECKO_API_KEY", public: false },
-  { name: "NEXT_PUBLIC_SUPABASE_URL", public: true },
-  { name: "NEXT_PUBLIC_SUPABASE_ANON_KEY", public: true },
-  { name: "SUPABASE_SERVICE_ROLE_KEY", public: false }
+  { name: "NEWS_API_KEY", public: false },
+  { name: "CRON_SECRET", public: false },
+  { name: "MARKET_DATA_PROVIDER", public: false },
+  { name: "NEWS_DATA_PROVIDER", public: false }
 ];
 
 const cache = new Map<string, { value: unknown; expiresAt: number; writtenAt: number; ttlMs: number }>();
@@ -152,6 +195,12 @@ const numberOr = (value: unknown, fallback = 0) => {
 };
 const safeText = (value: unknown) => (typeof value === "string" ? value : "");
 const normalizeSymbol = (symbol: string) => symbol.trim().toUpperCase();
+const normalizeAlphaTime = (value: string) => {
+  const match = value.match(/^(\d{4})(\d{2})(\d{2})T?(\d{2})(\d{2})(\d{2})$/);
+  if (!match) return nowIso();
+  const [, year, month, day, hour, minute, second] = match;
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}-04:00`;
+};
 
 const cryptoById: Record<string, { symbol: string; name: string }> = {
   bitcoin: { symbol: "BTC-USD", name: "Bitcoin" },
@@ -275,37 +324,40 @@ const quoteFromAsset = (asset: Asset, provider: MarketProvider = "Demo Fixture P
   currency: "USD"
 });
 
-const assetWithQuote = (asset: Asset, quote: ApiQuote, bars = asset.bars): Asset => ({
-  ...asset,
-  price: quote.price,
-  change: quote.change,
-  changePercent: quote.changePercent,
-  open: quote.open || asset.open,
-  previousClose: quote.previousClose || asset.previousClose,
-  dayHigh: quote.dayHigh || asset.dayHigh,
-  dayLow: quote.dayLow || asset.dayLow,
-  volume: quote.volume || asset.volume,
-  relativeVolume: asset.averageVolume ? Number(((quote.volume || asset.volume) / asset.averageVolume).toFixed(2)) : asset.relativeVolume,
-  bars,
-  meta: {
-    ...asset.meta,
-    provider: quote.provider,
-    lastUpdated: quote.timestamp,
-    providerTimestamp: quote.timestamp,
-    ingestionTimestamp: nowIso(),
-    dataStatus: quote.dataStatus,
-    marketStatus: quote.marketStatus
-  },
-  prediction: {
-    ...asset.prediction,
-    createdAt: quote.timestamp
-  }
-});
+const assetWithQuote = (asset: Asset, quote: ApiQuote, bars = asset.bars): Asset => {
+  const volume = quote.provider === "Demo Fixture Provider" ? asset.volume : quote.volume > 0 ? quote.volume : 0;
+  return {
+    ...asset,
+    price: quote.price,
+    change: quote.change,
+    changePercent: quote.changePercent,
+    open: quote.open || asset.open,
+    previousClose: quote.previousClose || asset.previousClose,
+    dayHigh: quote.dayHigh || asset.dayHigh,
+    dayLow: quote.dayLow || asset.dayLow,
+    volume,
+    relativeVolume: volume && asset.averageVolume ? Number((volume / asset.averageVolume).toFixed(2)) : 0,
+    bars,
+    meta: {
+      ...asset.meta,
+      provider: quote.provider,
+      lastUpdated: quote.timestamp,
+      providerTimestamp: quote.timestamp,
+      ingestionTimestamp: nowIso(),
+      dataStatus: quote.dataStatus,
+      marketStatus: quote.marketStatus
+    },
+    prediction: {
+      ...asset.prediction,
+      createdAt: quote.timestamp
+    }
+  };
+};
 
 const candlesForRange = (bars: Bar[], range: string) => {
   const upper = range.toUpperCase();
   const sizes: Record<string, number> = {
-    "1D": 1,
+    "1D": 2,
     "5D": 5,
     "1M": 22,
     "3M": 66,
@@ -318,19 +370,56 @@ const candlesForRange = (bars: Bar[], range: string) => {
   return bars.slice(-Math.min(sizes[upper] ?? 252, bars.length));
 };
 
+export const normalizeHistoryRequest = (rangeInput = "1Y", intervalInput?: string) => {
+  const range = rangeInput.toUpperCase();
+  const allowedRange = ["1D", "5D", "1M", "3M", "6M", "YTD", "1Y", "5Y", "MAX"].includes(range) ? range : "1Y";
+  const ytdDays = Math.max(1, Math.ceil((Date.now() - new Date(new Date().getFullYear(), 0, 1).getTime()) / 86_400_000));
+  const config: Record<string, { interval: string; finnhubResolution: string; twelveInterval: string; days: number; outputSize: number }> = {
+    "1D": { interval: "5m", finnhubResolution: "5", twelveInterval: "5min", days: 1, outputSize: 390 },
+    "5D": { interval: "30m", finnhubResolution: "30", twelveInterval: "30min", days: 5, outputSize: 390 },
+    "1M": { interval: "1h", finnhubResolution: "60", twelveInterval: "1h", days: 31, outputSize: 744 },
+    "3M": { interval: "1D", finnhubResolution: "D", twelveInterval: "1day", days: 93, outputSize: 93 },
+    "6M": { interval: "1D", finnhubResolution: "D", twelveInterval: "1day", days: 183, outputSize: 183 },
+    YTD: { interval: "1D", finnhubResolution: "D", twelveInterval: "1day", days: ytdDays, outputSize: ytdDays },
+    "1Y": { interval: "1D", finnhubResolution: "D", twelveInterval: "1day", days: 370, outputSize: 370 },
+    "5Y": { interval: "1W", finnhubResolution: "W", twelveInterval: "1week", days: 1825, outputSize: 1300 },
+    MAX: { interval: "1M", finnhubResolution: "M", twelveInterval: "1month", days: 3650, outputSize: 1200 }
+  };
+  const fallback = config[allowedRange];
+  const requestedInterval = intervalInput?.trim();
+  return {
+    range: allowedRange,
+    interval: requestedInterval || fallback.interval,
+    finnhubResolution: fallback.finnhubResolution,
+    twelveInterval: fallback.twelveInterval,
+    days: fallback.days,
+    outputSize: fallback.outputSize
+  };
+};
+
 const dedupeCandles = (bars: Bar[]) =>
   [...new Map(bars.filter((bar) => bar.time && Number.isFinite(bar.close)).map((bar) => [bar.time, bar])).values()].sort((a, b) => a.time.localeCompare(b.time));
+
+const actualRange = (candles: Bar[]) => ({
+  start: candles[0]?.time ?? null,
+  end: candles[candles.length - 1]?.time ?? null,
+  points: candles.length
+});
 
 const demoHistory = (symbol: string, range: string, interval: string, attempts: ProviderAttempt[] = []): HistoryEnvelope => {
   const asset = demoAssetForSymbol(symbol);
   if (!asset) throw new MarketDataError("Demo Fixture Provider", "not-found", "Symbol is not available in Demo Mode.");
+  const candles = candlesForRange(asset.bars, range);
   return {
     symbol: asset.symbol,
     range,
     interval,
-    candles: candlesForRange(asset.bars, range),
+    candles,
     provider: "Demo Fixture Provider",
     dataStatus: "Demo",
+    dataShape: "ohlc",
+    actualRange: actualRange(candles),
+    note: "Demo fixtures are stored daily bars. Short intraday ranges show available daily fallback data only.",
     generatedAt: nowIso(),
     cache: { hit: false, stale: false, ttlSeconds: 0 },
     attempts
@@ -351,20 +440,82 @@ const demoQuote = (symbol: string, attempts: ProviderAttempt[] = []): QuoteEnvel
 const missingKey = (provider: MarketProvider, envName: string) =>
   new MarketDataError(provider, "missing-key", `${envName} is not configured in Vercel/server environment variables.`);
 
-const marketStatusNow = (): MarketMeta["marketStatus"] => {
-  const date = new Date();
+const nthWeekdayOfMonth = (year: number, month: number, weekday: number, nth: number) => {
+  const first = new Date(Date.UTC(year, month, 1));
+  const offset = (weekday - first.getUTCDay() + 7) % 7;
+  return 1 + offset + (nth - 1) * 7;
+};
+
+const lastWeekdayOfMonth = (year: number, month: number, weekday: number) => {
+  const last = new Date(Date.UTC(year, month + 1, 0));
+  return last.getUTCDate() - ((last.getUTCDay() - weekday + 7) % 7);
+};
+
+const observedDate = (year: number, month: number, day: number) => {
+  const date = new Date(Date.UTC(year, month, day));
+  const weekday = date.getUTCDay();
+  if (weekday === 0) return `${year}-${String(month + 1).padStart(2, "0")}-${String(day + 1).padStart(2, "0")}`;
+  if (weekday === 6) return `${year}-${String(month + 1).padStart(2, "0")}-${String(day - 1).padStart(2, "0")}`;
+  return `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+};
+
+const easterDate = (year: number) => {
+  const a = year % 19;
+  const b = Math.floor(year / 100);
+  const c = year % 100;
+  const d = Math.floor(b / 4);
+  const e = b % 4;
+  const f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3);
+  const h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4);
+  const k = c % 4;
+  const l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31) - 1;
+  const day = ((h + l - 7 * m + 114) % 31) + 1;
+  return new Date(Date.UTC(year, month, day));
+};
+
+const marketHolidayDates = (year: number) => {
+  const easter = easterDate(year);
+  const goodFriday = new Date(easter);
+  goodFriday.setUTCDate(easter.getUTCDate() - 2);
+  const fmt = (month: number, day: number) => `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  return new Set([
+    observedDate(year, 0, 1),
+    fmt(0, nthWeekdayOfMonth(year, 0, 1, 3)),
+    fmt(1, nthWeekdayOfMonth(year, 1, 1, 3)),
+    goodFriday.toISOString().slice(0, 10),
+    fmt(4, lastWeekdayOfMonth(year, 4, 1)),
+    observedDate(year, 5, 19),
+    observedDate(year, 6, 4),
+    fmt(8, nthWeekdayOfMonth(year, 8, 1, 1)),
+    fmt(10, nthWeekdayOfMonth(year, 10, 4, 4)),
+    observedDate(year, 11, 25)
+  ]);
+};
+
+export const marketStatusNow = (date = new Date()): Exclude<MarketMeta["marketStatus"], "Continuous"> => {
   const eastern = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     weekday: "short",
     hour: "numeric",
     minute: "2-digit",
     hour12: false
   }).formatToParts(date);
   const weekday = eastern.find((part) => part.type === "weekday")?.value;
+  const year = Number(eastern.find((part) => part.type === "year")?.value ?? "0");
+  const month = eastern.find((part) => part.type === "month")?.value ?? "01";
+  const day = eastern.find((part) => part.type === "day")?.value ?? "01";
   const hour = Number(eastern.find((part) => part.type === "hour")?.value ?? "0");
   const minute = Number(eastern.find((part) => part.type === "minute")?.value ?? "0");
   const minutes = hour * 60 + minute;
   if (weekday === "Sat" || weekday === "Sun") return "Closed";
+  if (marketHolidayDates(year).has(`${year}-${month}-${day}`)) return "Closed";
   if (minutes < 570) return "Pre-market";
   if (minutes >= 960 && minutes < 1200) return "After-hours";
   if (minutes >= 570 && minutes < 960) return "Open";
@@ -377,39 +528,86 @@ const providerStatus = () => [
     configured: Boolean(providerEnv.finnhub()),
     serverSideOnly: true,
     status: providerEnv.finnhub() ? "Configured server-side" : "Missing FINNHUB_API_KEY",
-    supports: ["stock quotes", "stock candles", "symbol search", "company news"]
+    supports: ["stock quotes", "stock candles", "symbol search", "company news"],
+    lastSuccessfulRequest: null,
+    lastFailedRequest: null,
+    currentError: providerEnv.finnhub() ? null : "FINNHUB_API_KEY is missing.",
+    rateLimitState: "unknown" as const,
+    dataFreshness: providerEnv.finnhub() ? ("timing-not-guaranteed" as const) : ("unavailable" as const),
+    fallbackActive: !providerEnv.finnhub(),
+    cacheHitRate: null,
+    averageResponseTimeMs: null
   },
   {
     name: "Twelve Data" as const,
     configured: Boolean(providerEnv.twelveData()),
     serverSideOnly: true,
     status: providerEnv.twelveData() ? "Configured server-side" : "Missing TWELVE_DATA_API_KEY",
-    supports: ["stock quotes", "stock candles", "symbol search"]
+    supports: ["stock quotes", "stock candles", "symbol search"],
+    lastSuccessfulRequest: null,
+    lastFailedRequest: null,
+    currentError: providerEnv.twelveData() ? null : "TWELVE_DATA_API_KEY is missing.",
+    rateLimitState: "unknown" as const,
+    dataFreshness: providerEnv.twelveData() ? ("timing-not-guaranteed" as const) : ("unavailable" as const),
+    fallbackActive: !providerEnv.twelveData(),
+    cacheHitRate: null,
+    averageResponseTimeMs: null
   },
   {
     name: "Alpha Vantage" as const,
     configured: Boolean(providerEnv.alphaVantage()),
     serverSideOnly: true,
     status: providerEnv.alphaVantage() ? "Configured server-side" : "Missing ALPHA_VANTAGE_API_KEY",
-    supports: ["stock quotes", "daily history", "symbol search", "news sentiment"]
+    supports: ["stock quotes", "daily history", "symbol search", "news sentiment"],
+    lastSuccessfulRequest: null,
+    lastFailedRequest: null,
+    currentError: providerEnv.alphaVantage() ? null : "ALPHA_VANTAGE_API_KEY is missing.",
+    rateLimitState: "unknown" as const,
+    dataFreshness: providerEnv.alphaVantage() ? ("end-of-day" as const) : ("unavailable" as const),
+    fallbackActive: !providerEnv.alphaVantage(),
+    cacheHitRate: null,
+    averageResponseTimeMs: null
   },
   {
     name: "CoinGecko" as const,
     configured: true,
     serverSideOnly: true,
     status: providerEnv.coinGecko() ? "Configured with API key" : "Using public CoinGecko endpoint; add COINGECKO_API_KEY for higher limits",
-    supports: ["crypto quotes", "crypto market charts"]
+    supports: ["crypto quotes", "crypto market charts"],
+    lastSuccessfulRequest: null,
+    lastFailedRequest: null,
+    currentError: null,
+    rateLimitState: "unknown" as const,
+    dataFreshness: "near-real-time" as const,
+    fallbackActive: false,
+    cacheHitRate: null,
+    averageResponseTimeMs: null
   }
 ];
 
 export const getRuntimeStatus = (): RuntimeStatus => {
   const providers = providerStatus();
   const stockConfigured = providers.some((provider) => provider.name !== "CoinGecko" && provider.configured);
+  const mode: RuntimeStatus["mode"] = stockConfigured ? "mixed" : "demo";
+  const stockMarketStatus = marketStatusNow();
   return {
-    mode: stockConfigured ? "mixed" : "demo",
+    mode,
+    applicationMode: applicationModeLabel(mode),
     demoMode: !stockConfigured,
     generatedAt: nowIso(),
-    marketStatus: marketStatusNow(),
+    marketStatus: stockMarketStatus,
+    stockMarketStatus,
+    cryptoMarketStatus: "Continuous",
+    cronSchedule: {
+      path: "/api/ingest",
+      expression: "0 9 * * *",
+      description: "Backend ingestion scheduled daily at 09:00 UTC."
+    },
+    cacheBackend: {
+      kind: "per-instance-memory",
+      durable: false,
+      note: "Serverless memory cache is per Vercel instance. It deduplicates and serves stale fallback locally, but it is not a global durable cache."
+    },
     cachePolicy: {
       stockQuotes: "30-60 seconds",
       cryptoQuotes: "30-60 seconds",
@@ -431,7 +629,10 @@ export const getRuntimeStatus = (): RuntimeStatus => {
       "/api/news?symbol=AAPL",
       "/api/status",
       "/api/crypto/quote?id=bitcoin",
-      "/api/crypto/history?id=bitcoin&range=1Y"
+      "/api/crypto/history?id=bitcoin&range=1Y",
+      "/api/alerts",
+      "/api/ingest",
+      "/api/admin/diagnostics"
     ],
     fixtureCounts: {
       assets: demoAssets.length,
@@ -462,7 +663,7 @@ const finnhubQuote = async (symbol: string): Promise<ApiQuote> => {
     volume: base?.volume ?? 0,
     timestamp: payload.t ? new Date(numberOr(payload.t) * 1000).toISOString() : nowIso(),
     provider: "Finnhub",
-    dataStatus: "Live",
+    dataStatus: "Delayed",
     marketStatus: marketStatusNow(),
     currency: "USD"
   };
@@ -490,7 +691,7 @@ const twelveQuote = async (symbol: string): Promise<ApiQuote> => {
     volume: numberOr(payload.volume, base?.volume ?? 0),
     timestamp: payload.timestamp ? new Date(numberOr(payload.timestamp) * 1000).toISOString() : nowIso(),
     provider: "Twelve Data",
-    dataStatus: "Live",
+    dataStatus: "Delayed",
     marketStatus: marketStatusNow(),
     currency: "USD"
   };
@@ -588,19 +789,19 @@ export const getStockQuote = async (symbolInput: string, options: { refresh?: bo
 const finnhubHistory = async (symbol: string, range: string): Promise<Bar[]> => {
   const key = providerEnv.finnhub();
   if (!key) throw missingKey("Finnhub", "FINNHUB_API_KEY");
+  const config = normalizeHistoryRequest(range);
   const to = Math.floor(Date.now() / 1000);
-  const days = range.toUpperCase() === "5Y" ? 1825 : range.toUpperCase() === "6M" ? 183 : range.toUpperCase() === "3M" ? 92 : 370;
-  const from = to - days * 24 * 60 * 60;
+  const from = to - config.days * 24 * 60 * 60;
   const payload = await fetchJson<{ s?: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; v?: number[] }>(
     "Finnhub",
-    `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=D&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
+    `https://finnhub.io/api/v1/stock/candle?symbol=${encodeURIComponent(symbol)}&resolution=${config.finnhubResolution}&from=${from}&to=${to}&token=${encodeURIComponent(key)}`,
     undefined,
     8000
   );
   if (payload.s !== "ok" || !payload.t?.length) throw new MarketDataError("Finnhub", "not-found", "Finnhub did not return candles for this symbol.");
   return dedupeCandles(
     payload.t.map((time, index) => ({
-      time: new Date(time * 1000).toISOString().slice(0, 10),
+      time: config.finnhubResolution === "D" || config.finnhubResolution === "W" || config.finnhubResolution === "M" ? new Date(time * 1000).toISOString().slice(0, 10) : new Date(time * 1000).toISOString(),
       open: numberOr(payload.o?.[index]),
       high: numberOr(payload.h?.[index]),
       low: numberOr(payload.l?.[index]),
@@ -610,12 +811,13 @@ const finnhubHistory = async (symbol: string, range: string): Promise<Bar[]> => 
   );
 };
 
-const twelveHistory = async (symbol: string): Promise<Bar[]> => {
+const twelveHistory = async (symbol: string, range: string): Promise<Bar[]> => {
   const key = providerEnv.twelveData();
   if (!key) throw missingKey("Twelve Data", "TWELVE_DATA_API_KEY");
+  const config = normalizeHistoryRequest(range);
   const payload = await fetchJson<{ status?: string; message?: string; values?: Array<Record<string, string>> }>(
     "Twelve Data",
-    `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=1day&outputsize=500&apikey=${encodeURIComponent(key)}`,
+    `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(symbol)}&interval=${config.twelveInterval}&outputsize=${config.outputSize}&apikey=${encodeURIComponent(key)}`,
     undefined,
     8000
   );
@@ -653,29 +855,33 @@ const alphaHistory = async (symbol: string): Promise<Bar[]> => {
 
 export const getStockHistory = async (symbolInput: string, range = "1Y", interval = "1D", options: { refresh?: boolean } = {}): Promise<HistoryEnvelope> => {
   const symbol = normalizeSymbol(symbolInput);
-  const key = `stock-history:${symbol}:${range}:${interval}`;
+  const request = normalizeHistoryRequest(range, interval);
+  const key = `stock-history:${symbol}:${request.range}:${request.interval}`;
   const cached = !options.refresh ? getCache<HistoryEnvelope>(key) : null;
   if (cached) return { ...cached.value, generatedAt: nowIso(), dataStatus: "Cached", provider: "Cached data", cache: cached.cache };
 
   return dedupe(key, async () => {
     const attempts: ProviderAttempt[] = [];
     for (const [provider, task] of [
-      ["Finnhub", () => finnhubHistory(symbol, range)],
-      ["Twelve Data", () => twelveHistory(symbol)],
+      ["Finnhub", () => finnhubHistory(symbol, request.range)],
+      ["Twelve Data", () => twelveHistory(symbol, request.range)],
       ["Alpha Vantage", () => alphaHistory(symbol)]
     ] as const) {
       try {
-        const candles = candlesForRange(await task(), range);
+        const candles = candlesForRange(await task(), request.range);
         attempts.push({ provider, status: "success", message: "Provider returned normalized historical candles." });
         return setCache(
           key,
           {
             symbol,
-            range,
-            interval,
+            range: request.range,
+            interval: request.interval,
             candles,
             provider,
-            dataStatus: provider === "Alpha Vantage" ? "Delayed" : "Live",
+            dataStatus: "Delayed",
+            dataShape: "ohlc",
+            actualRange: actualRange(candles),
+            note: interval === "1D" ? "Daily OHLC candles returned by the active stock provider or fallback provider." : "Range requested with provider-specific intraday interval when supported; fallback providers may return daily candles.",
             generatedAt: nowIso(),
             cache: { hit: false, stale: false, ttlSeconds: Math.round(historyTtlMs / 1000) },
             attempts
@@ -688,7 +894,7 @@ export const getStockHistory = async (symbolInput: string, range = "1Y", interva
     }
     const stale = getCache<HistoryEnvelope>(key, true);
     if (stale) return { ...stale.value, provider: "Cached data", dataStatus: "Cached", generatedAt: nowIso(), cache: { ...stale.cache, stale: true }, attempts };
-    return demoHistory(symbol, range, interval, attempts);
+    return demoHistory(symbol, request.range, request.interval, attempts);
   });
 };
 
@@ -731,7 +937,7 @@ export const getCryptoQuote = async (idInput: string, options: { refresh?: boole
         volume: Math.round(numberOr(data.usd_24h_vol, base?.volume ?? 0)),
         timestamp: data.last_updated_at ? new Date(data.last_updated_at * 1000).toISOString() : nowIso(),
         provider: "CoinGecko",
-        dataStatus: "Live",
+        dataStatus: "Delayed",
         marketStatus: "Continuous",
         currency: "USD"
       };
@@ -756,47 +962,48 @@ export const getCryptoQuote = async (idInput: string, options: { refresh?: boole
 export const getCryptoHistory = async (idInput: string, range = "1Y", options: { refresh?: boolean } = {}): Promise<HistoryEnvelope> => {
   const id = idInput.trim().toLowerCase();
   const mapped = cryptoById[id];
-  const key = `crypto-history:${id}:${range}`;
+  const request = normalizeHistoryRequest(range);
+  const key = `crypto-history:${id}:${request.range}:${request.interval}`;
   const cached = !options.refresh ? getCache<HistoryEnvelope>(key) : null;
   if (cached) return { ...cached.value, generatedAt: nowIso(), dataStatus: "Cached", provider: "Cached data", cache: cached.cache };
 
   return dedupe(key, async () => {
     const attempts: ProviderAttempt[] = [];
     try {
-      const days = range.toUpperCase() === "5Y" ? 1825 : range.toUpperCase() === "6M" ? 180 : range.toUpperCase() === "3M" ? 90 : 365;
+      const days = request.range === "MAX" ? "max" : request.days;
       const payload = await fetchJson<{ prices?: Array<[number, number]>; total_volumes?: Array<[number, number]> }>(
         "CoinGecko",
-        `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${days}&interval=daily`,
+        `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${days}&interval=${request.interval === "5m" || request.interval === "30m" || request.interval === "1h" ? "hourly" : "daily"}`,
         coinGeckoHeaders(),
         8000
       );
       if (!payload.prices?.length) throw new MarketDataError("CoinGecko", "not-found", "CoinGecko did not return historical prices for this coin id.");
       const candles = dedupeCandles(
         payload.prices.map(([time, price], index) => {
-          const previous = payload.prices?.[Math.max(index - 1, 0)]?.[1] ?? price;
           const volume = payload.total_volumes?.[index]?.[1] ?? 0;
-          const high = Math.max(price, previous);
-          const low = Math.min(price, previous);
           return {
             time: new Date(time).toISOString().slice(0, 10),
-            open: Number(previous.toFixed(2)),
-            high: Number(high.toFixed(2)),
-            low: Number(low.toFixed(2)),
+            open: Number(price.toFixed(2)),
+            high: Number(price.toFixed(2)),
+            low: Number(price.toFixed(2)),
             close: Number(price.toFixed(2)),
             volume: Math.round(volume)
           };
         })
       );
-      attempts.push({ provider: "CoinGecko", status: "success", message: "CoinGecko returned normalized historical crypto candles." });
+      attempts.push({ provider: "CoinGecko", status: "success", message: "CoinGecko returned a crypto price series. OHLC candles were not fabricated." });
       return setCache(
         key,
         {
           symbol: mapped?.symbol ?? id.toUpperCase(),
-          range,
-          interval: "1D",
+          range: request.range,
+          interval: request.interval,
           candles,
           provider: "CoinGecko",
-          dataStatus: "Live",
+          dataStatus: "Delayed",
+          dataShape: "price-series",
+          actualRange: actualRange(candles),
+          note: "CoinGecko market_chart returns price-series data here, not true OHLC candles. The frontend must display this as a line/area chart only.",
           generatedAt: nowIso(),
           cache: { hit: false, stale: false, ttlSeconds: Math.round(historyTtlMs / 1000) },
           attempts
@@ -809,7 +1016,7 @@ export const getCryptoHistory = async (idInput: string, range = "1Y", options: {
       if (stale) return { ...stale.value, provider: "Cached data", dataStatus: "Cached", generatedAt: nowIso(), cache: { ...stale.cache, stale: true }, attempts };
       const demo = demoCryptoForId(id);
       if (!demo) throw new MarketDataError("Demo Fixture Provider", "not-found", "Crypto id is not supported in Demo Mode.");
-      return demoHistory(demo.symbol, range, "1D", attempts);
+      return demoHistory(demo.symbol, request.range, request.interval, attempts);
     }
   });
 };
@@ -845,7 +1052,7 @@ export const getSearchResults = async (queryInput: string): Promise<SearchEnvelo
     if (!keyValue) throw missingKey("Finnhub", "FINNHUB_API_KEY");
     const payload = await fetchJson<{ result?: Array<{ symbol?: string; description?: string; type?: string }> }>("Finnhub", `https://finnhub.io/api/v1/search?q=${encodeURIComponent(query)}&token=${encodeURIComponent(keyValue)}`);
     payload.result?.slice(0, 10).forEach((item) => {
-      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.description || item.symbol, type: "stock", provider: "Finnhub", dataStatus: "Live" });
+      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.description || item.symbol, type: "stock", provider: "Finnhub", dataStatus: "Delayed" });
     });
     attempts.push({ provider: "Finnhub", status: "success", message: "Finnhub search returned results." });
   } catch (error) {
@@ -857,7 +1064,7 @@ export const getSearchResults = async (queryInput: string): Promise<SearchEnvelo
     if (!keyValue) throw missingKey("Twelve Data", "TWELVE_DATA_API_KEY");
     const payload = await fetchJson<{ data?: Array<{ symbol?: string; instrument_name?: string; exchange?: string; instrument_type?: string }> }>("Twelve Data", `https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(query)}&apikey=${encodeURIComponent(keyValue)}`);
     payload.data?.slice(0, 10).forEach((item) => {
-      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.instrument_name || item.symbol, type: "stock", exchange: item.exchange, provider: "Twelve Data", dataStatus: "Live" });
+      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.instrument_name || item.symbol, type: "stock", exchange: item.exchange, provider: "Twelve Data", dataStatus: "Delayed" });
     });
     attempts.push({ provider: "Twelve Data", status: "success", message: "Twelve Data search returned results." });
   } catch (error) {
@@ -914,7 +1121,9 @@ export const getNews = async (symbolInput?: string, queryInput?: string): Promis
           impactScore: 60,
           relatedSymbols: [symbol],
           summary: safeText(item.summary) || "Provider news item.",
-          url: safeText(item.url) || undefined
+          url: safeText(item.url) || undefined,
+          provider: "Finnhub",
+          dataStatus: "Delayed"
         });
       });
       attempts.push({ provider: "Finnhub", status: "success", message: "Finnhub returned company news." });
@@ -931,12 +1140,14 @@ export const getNews = async (symbolInput?: string, queryInput?: string): Promis
           id: `alpha-${symbol}-${index}`,
           headline: safeText(item.title) || "Untitled market news",
           source: safeText(item.source) || "Alpha Vantage",
-          publishedAt: safeText(item.time_published) || nowIso(),
+          publishedAt: normalizeAlphaTime(safeText(item.time_published)),
           tone: numberOr(item.overall_sentiment_score) > 0.1 ? "Positive" : numberOr(item.overall_sentiment_score) < -0.1 ? "Negative" : "Neutral",
           impactScore: Math.min(95, Math.max(35, Math.round(Math.abs(numberOr(item.overall_sentiment_score)) * 100))),
           relatedSymbols: [symbol],
           summary: safeText(item.summary) || "Provider news item.",
-          url: safeText(item.url) || undefined
+          url: safeText(item.url) || undefined,
+          provider: "Alpha Vantage",
+          dataStatus: "Delayed"
         });
       });
       attempts.push({ provider: "Alpha Vantage", status: "success", message: "Alpha Vantage returned news sentiment." });
@@ -960,7 +1171,9 @@ export const getNews = async (symbolInput?: string, queryInput?: string): Promis
         }))
       : demoNews;
 
-  const news = rows.length ? rows : fallback;
+  const news = rows.length
+    ? [...new Map(rows.map((item) => [`${item.headline.toLowerCase()}|${item.source.toLowerCase()}`, item])).values()]
+    : fallback.map((item) => ({ ...item, provider: item.provider ?? "Demo Fixture Provider", dataStatus: item.dataStatus ?? "Demo" }));
   const envelope = {
     news,
     generatedAt: nowIso(),
