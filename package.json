@@ -8,7 +8,7 @@
     "dev": "next dev --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start --hostname 0.0.0.0",
-    "lint": "tsc --noEmit --pretty false",
+    "lint": "next typegen && tsc --noEmit --pretty false",
     "test": "vitest run",
     "test:watch": "vitest",
     "ingest:market": "tsx scripts/market-ingestion.ts",

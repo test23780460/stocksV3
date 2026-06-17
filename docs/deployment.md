@@ -33,7 +33,9 @@ Add all provider keys and service keys as private Vercel variables:
 
 ## Cron
 
-`vercel.json` schedules `/api/ingest` every five minutes. If `CRON_SECRET` is set, call the route with:
+`vercel.json` schedules `/api/ingest` once per day at `0 9 * * *` so the project can deploy on Vercel Hobby. Vercel's 2026 Cron limits allow once-per-day jobs on Hobby; Pro or Enterprise can use minute-level schedules such as `*/5 * * * *`.
+
+If `CRON_SECRET` is set, call the route with:
 
 ```bash
 Authorization: Bearer <CRON_SECRET>

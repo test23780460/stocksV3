@@ -1,10 +1,10 @@
 import { NextResponse } from "next/server";
-import { getSafeMarketSnapshot } from "../../../services/providerRegistry";
+import { getMarketSnapshot } from "../../../services/marketData";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  return NextResponse.json(getSafeMarketSnapshot(), {
+  return NextResponse.json(await getMarketSnapshot(), {
     headers: {
       "Cache-Control": "s-maxage=60, stale-while-revalidate=300"
     }

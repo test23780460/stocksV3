@@ -9,7 +9,7 @@ Educational market research only. Nothing in this project is financial advice. P
 - App framework: Next.js App Router, React, TypeScript, Lightweight Charts, CSS design system
 - Hosting target: Vercel connected to the GitHub repository
 - API routes: Vercel serverless handlers under `src/app/api`
-- Cron route: `/api/ingest` scheduled every five minutes through `vercel.json`
+- Cron route: `/api/ingest` scheduled once per day through `vercel.json` for Vercel Hobby compatibility
 - Demo fallback: deterministic fixtures for assets, charts, news, predictions, provider health, and alerts
 - Storage/auth readiness: Supabase migrations, RLS, and disabled auth UI until Supabase env vars are configured
 

@@ -39,7 +39,8 @@ import { calculateMarketMood, calculateScenario } from "./lib/calculations";
 import { compactNumber, currency, formatDateTime, percent } from "./lib/format";
 import { explainStatus, statusSeverity } from "./lib/dataStatus";
 import { hasSupabaseConfig } from "./supabaseClient";
-import type { Asset, AssetType, SignalLabel } from "./types";
+import type { Asset, AssetType, NewsItem, ProviderHealth, SignalLabel } from "./types";
+import type { HistoryEnvelope, RuntimeStatus } from "./services/marketData";
 
 type RouteId =
   | "dashboard"
@@ -67,6 +68,14 @@ type RouteId =
 
 type ExperienceMode = "beginner" | "intermediate" | "advanced";
 type SortKey = "symbol" | "price" | "changePercent" | "volume" | "risk" | "confidence";
+type MarketPayload = {
+  assets: Asset[];
+  news: NewsItem[];
+  status: RuntimeStatus;
+  providerHealth: ProviderHealth[];
+  generatedAt: string;
+  cache: { hit: boolean; stale: boolean; ttlSeconds: number };
+};
 
 interface NavItem {
   id: RouteId;
@@ -141,6 +150,14 @@ const routeAssetType: Partial<Record<RouteId, AssetType>> = {
   crypto: "crypto",
   etfs: "etf",
   indexes: "index"
+};
+
+const cryptoApiId = (symbol: string) => {
+  const normalized = symbol.toUpperCase().replace("-USD", "");
+  if (normalized === "BTC" || normalized === "BTCUSD") return "bitcoin";
+  if (normalized === "ETH" || normalized === "ETHUSD") return "ethereum";
+  if (normalized === "SOL" || normalized === "SOLUSD") return "solana";
+  return symbol.toLowerCase();
 };
 
 function Badge({ children, tone = "neutral" }: { children: React.ReactNode; tone?: string }) {
@@ -236,6 +253,10 @@ export default function App() {
   const [toast, setToast] = useState("Demo Mode active. Add provider keys in Vercel to enable live data.");
   const [lastRefresh, setLastRefresh] = useState("2026-06-15T14:36:03-04:00");
   const [refreshing, setRefreshing] = useState(false);
+  const [marketAssets, setMarketAssets] = useState<Asset[]>(demoAssets);
+  const [marketNews, setMarketNews] = useState<NewsItem[]>(demoNews);
+  const [providerRows, setProviderRows] = useState<ProviderHealth[]>(providerHealth);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   const [watchlists, setWatchlists] = useState([
     { id: "default", name: "Default Research", symbols: ["MSFT", "SPY", "BTC-USD"], notes: "Demo local watchlist." },
     { id: "risk", name: "High Risk Watch", symbols: ["TSLA", "SOL-USD"], notes: "Keep position sizing research conservative." }
@@ -253,12 +274,12 @@ export default function App() {
   const [scenarioAmount, setScenarioAmount] = useState(1000);
   const searchRef = useRef<HTMLDivElement | null>(null);
 
-  const selectedAsset = demoAssets.find((asset) => asset.symbol === selectedSymbol) ?? demoAssets[0];
-  const mood = useMemo(() => calculateMarketMood(demoAssets), []);
+  const selectedAsset = marketAssets.find((asset) => asset.symbol === selectedSymbol) ?? marketAssets[0] ?? demoAssets[0];
+  const mood = useMemo(() => calculateMarketMood(marketAssets), [marketAssets]);
   const currentWatchlist = watchlists.find((list) => list.id === activeWatchlist) ?? watchlists[0];
   const marketScope = routeAssetType[route];
-  const scopedAssets = marketScope ? demoAssets.filter((asset) => asset.type === marketScope) : demoAssets;
-  const searchMatches = useMemo(() => fuzzySearchAssets(query).slice(0, 7), [query]);
+  const scopedAssets = marketScope ? marketAssets.filter((asset) => asset.type === marketScope) : marketAssets;
+  const searchMatches = useMemo(() => fuzzySearchAssets(query, marketAssets).slice(0, 7), [query, marketAssets]);
   const glossaryMatches = useMemo(() => searchGlossary(query).slice(0, 18), [query]);
   const scenario = calculateScenario({
     amount: scenarioAmount,
@@ -300,13 +321,71 @@ export default function App() {
     return () => document.removeEventListener("mousedown", closeSearch);
   }, []);
 
+  const applyMarketPayload = (payload: MarketPayload) => {
+    setMarketAssets(payload.assets.length ? payload.assets : demoAssets);
+    setMarketNews(payload.news.length ? payload.news : demoNews);
+    setProviderRows(payload.providerHealth.length ? payload.providerHealth : providerHealth);
+    setRuntimeStatus(payload.status);
+    setLastRefresh(payload.generatedAt);
+    const liveCount = payload.assets.filter((asset) => asset.meta.dataStatus === "Live" || asset.meta.dataStatus === "Delayed").length;
+    const sourceLabel = payload.cache.hit ? "Cached" : liveCount ? "Provider-backed" : "Demo fallback";
+    setToast(`${sourceLabel} market data loaded. ${liveCount}/${payload.assets.length} assets have provider-backed labels.`);
+  };
+
+  const loadAssetHistory = async (asset: Asset, refresh = false) => {
+    try {
+      const endpoint =
+        asset.type === "crypto"
+          ? `/api/crypto/history?id=${encodeURIComponent(cryptoApiId(asset.symbol))}&range=1Y${refresh ? "&refresh=true" : ""}`
+          : `/api/history?symbol=${encodeURIComponent(asset.symbol)}&range=1Y&interval=1D${refresh ? "&refresh=true" : ""}`;
+      const response = await fetch(endpoint);
+      if (!response.ok) return;
+      const history = (await response.json()) as HistoryEnvelope;
+      if (!history.candles?.length) return;
+      setMarketAssets((assets) =>
+        assets.map((item) =>
+          item.symbol === asset.symbol
+            ? {
+                ...item,
+                bars: history.candles,
+                meta: {
+                  ...item.meta,
+                  provider: history.provider,
+                  dataStatus: history.dataStatus,
+                  lastUpdated: history.generatedAt,
+                  providerTimestamp: history.generatedAt
+                }
+              }
+            : item
+        )
+      );
+    } catch {
+      setToast("Historical chart refresh failed. Existing cached or demo candles remain visible.");
+    }
+  };
+
+  const loadMarkets = async (refresh = false) => {
+    const response = await fetch(`/api/markets${refresh ? "?refresh=true" : ""}`);
+    if (!response.ok) throw new Error("Market API failed");
+    const payload = (await response.json()) as MarketPayload;
+    applyMarketPayload(payload);
+    const current = payload.assets.find((asset) => asset.symbol === selectedSymbol) ?? payload.assets[0];
+    if (current) void loadAssetHistory(current, refresh);
+  };
+
+  useEffect(() => {
+    void loadMarkets(false).catch(() => {
+      setToast("Market API unavailable. Demo fixtures remain visible.");
+    });
+  }, []);
+
   const openRoute = (id: RouteId) => {
     setRoute(id);
     setMobileMenuOpen(false);
   };
 
   const openAsset = (symbol: string) => {
-    const asset = demoAssets.find((item) => item.symbol === symbol);
+    const asset = marketAssets.find((item) => item.symbol === symbol);
     if (!asset) {
       setToast("Asset not found. Use search suggestions or return to search.");
       return;
@@ -317,6 +396,7 @@ export default function App() {
     setSearchOpen(false);
     setRecentSearches((current) => [symbol, ...current.filter((item) => item !== symbol)].slice(0, 6));
     setToast(`${symbol} opened with stored ${asset.meta.dataStatus} data.`);
+    void loadAssetHistory(asset);
   };
 
   const handleSearchSubmit = (event: FormEvent) => {
@@ -346,6 +426,7 @@ export default function App() {
     try {
       const response = await fetch("/api/refresh", { method: "POST" });
       const payload = (await response.json()) as { status: string; lastUpdated: string; message: string };
+      await loadMarkets(true);
       setLastRefresh(payload.lastUpdated);
       setToast(payload.message);
     } catch {
@@ -448,7 +529,7 @@ export default function App() {
           </div>
         </header>
 
-        <TickerTape onOpen={openAsset} />
+        <TickerTape assets={marketAssets} onOpen={openAsset} />
         <SafetyStrip />
 
         {route === "dashboard" ? (
@@ -460,12 +541,15 @@ export default function App() {
             onOpen={openAsset}
             onWatch={toggleWatchlistAsset}
             watchlist={currentWatchlist}
+            assets={marketAssets}
+            news={marketNews}
+            runtimeStatus={runtimeStatus}
           />
         ) : null}
         {["stocks", "crypto", "etfs", "indexes"].includes(route) ? (
-          <AssetDetail asset={selectedAsset} assets={scopedAssets} experience={experience} onOpen={openAsset} onWatch={toggleWatchlistAsset} />
+          <AssetDetail asset={selectedAsset} assets={scopedAssets} news={marketNews} experience={experience} onOpen={openAsset} onWatch={toggleWatchlistAsset} />
         ) : null}
-        {route === "news" ? <NewsDesk onOpen={openAsset} /> : null}
+        {route === "news" ? <NewsDesk news={marketNews} onOpen={openAsset} /> : null}
         {route === "screener" ? (
           <Screener
             type={screenerType}
@@ -482,16 +566,18 @@ export default function App() {
             onOpen={openAsset}
             onWatch={toggleWatchlistAsset}
             onExport={exportCsv}
+            assets={marketAssets}
           />
         ) : null}
-        {route === "predictions" ? <PredictionsPage selectedAsset={selectedAsset} scenarioAmount={scenarioAmount} setScenarioAmount={setScenarioAmount} scenario={scenario} /> : null}
-        {route === "compare" ? <ComparePage onOpen={openAsset} /> : null}
-        {route === "ideas" ? <ResearchIdeas onOpen={openAsset} onWatch={toggleWatchlistAsset} /> : null}
+        {route === "predictions" ? <PredictionsPage selectedAsset={selectedAsset} assets={marketAssets} scenarioAmount={scenarioAmount} setScenarioAmount={setScenarioAmount} scenario={scenario} /> : null}
+        {route === "compare" ? <ComparePage assets={marketAssets} onOpen={openAsset} /> : null}
+        {route === "ideas" ? <ResearchIdeas assets={marketAssets} onOpen={openAsset} onWatch={toggleWatchlistAsset} /> : null}
         {route === "watchlists" ? (
           <WatchlistsPage
             watchlists={watchlists}
             activeWatchlist={activeWatchlist}
             sort={watchlistSort}
+            assets={marketAssets}
             onActive={setActiveWatchlist}
             onSort={setWatchlistSort}
             onCreate={createWatchlist}
@@ -511,8 +597,8 @@ export default function App() {
         {route === "definitions" ? <DefinitionsPage terms={glossaryMatches.length ? glossaryMatches : glossaryTerms} /> : null}
         {route === "profile" ? <ProfilePage experience={experience} theme={theme} /> : null}
         {route === "settings" ? <SettingsPage adminMode={adminMode} setAdminMode={setAdminMode} /> : null}
-        {route === "status" ? <SystemStatus lastRefresh={lastRefresh} /> : null}
-        {["admin", "backend", "quality", "api-usage", "audit"].includes(route) ? <AdminPage route={route} /> : null}
+        {route === "status" ? <SystemStatus lastRefresh={lastRefresh} providerRows={providerRows} runtimeStatus={runtimeStatus} /> : null}
+        {["admin", "backend", "quality", "api-usage", "audit"].includes(route) ? <AdminPage route={route} runtimeStatus={runtimeStatus} /> : null}
 
         <div className="toast" role="status">
           {toast}
@@ -671,10 +757,10 @@ function GlobalSearch({
   );
 }
 
-function TickerTape({ onOpen }: { onOpen: (symbol: string) => void }) {
+function TickerTape({ assets, onOpen }: { assets: Asset[]; onOpen: (symbol: string) => void }) {
   return (
     <section className="ticker-tape" aria-label="Market ticker tape">
-      {demoAssets.map((asset) => (
+      {assets.map((asset) => (
         <button key={asset.symbol} className="ticker-pill" type="button" onClick={() => onOpen(asset.symbol)}>
           <strong>{asset.symbol}</strong>
           <span>{currency(asset.price)}</span>
@@ -700,6 +786,9 @@ function Dashboard({
   lastRefresh,
   refreshing,
   watchlist,
+  assets,
+  news,
+  runtimeStatus,
   onRefresh,
   onOpen,
   onWatch
@@ -708,16 +797,21 @@ function Dashboard({
   lastRefresh: string;
   refreshing: boolean;
   watchlist: { symbols: string[]; name: string };
+  assets: Asset[];
+  news: NewsItem[];
+  runtimeStatus: RuntimeStatus | null;
   onRefresh: () => void;
   onOpen: (symbol: string) => void;
   onWatch: (symbol: string) => void;
 }) {
-  const gainers = [...demoAssets].sort((a, b) => b.changePercent - a.changePercent).slice(0, 5);
-  const losers = [...demoAssets].sort((a, b) => a.changePercent - b.changePercent).slice(0, 5);
-  const trending = [...demoAssets].sort((a, b) => b.hype - a.hype).slice(0, 5);
-  const unusual = [...demoAssets].sort((a, b) => b.relativeVolume - a.relativeVolume).slice(0, 5);
-  const watchAssets = demoAssets.filter((asset) => watchlist.symbols.includes(asset.symbol));
-  const indexes = demoAssets.filter((asset) => asset.type === "index" || asset.type === "etf").slice(0, 5);
+  const gainers = [...assets].sort((a, b) => b.changePercent - a.changePercent).slice(0, 5);
+  const losers = [...assets].sort((a, b) => a.changePercent - b.changePercent).slice(0, 5);
+  const trending = [...assets].sort((a, b) => b.hype - a.hype).slice(0, 5);
+  const unusual = [...assets].sort((a, b) => b.relativeVolume - a.relativeVolume).slice(0, 5);
+  const watchAssets = assets.filter((asset) => watchlist.symbols.includes(asset.symbol));
+  const indexes = assets.filter((asset) => asset.type === "index" || asset.type === "etf").slice(0, 5);
+  const liveCount = assets.filter((asset) => asset.meta.dataStatus === "Live" || asset.meta.dataStatus === "Delayed").length;
+  const providerLabel = runtimeStatus?.mode === "demo" ? "Demo fallback" : runtimeStatus?.mode === "mixed" ? "Mixed provider data" : "Live providers";
   const easternTime = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     hour: "numeric",
@@ -732,14 +826,14 @@ function Dashboard({
       <section className="feature-panel status-hero">
         <div>
           <span className="eyebrow">Market status and data freshness</span>
-          <h2>Market open: demo session</h2>
+          <h2>Market status: {runtimeStatus?.marketStatus ?? "checking"}</h2>
           <p>
-            Eastern Time {easternTime} | Last successful update {formatDateTime(lastRefresh)} | Provider: Demo Fixture Provider
+            Eastern Time {easternTime} | Last successful update {formatDateTime(lastRefresh)} | Source: {providerLabel}
           </p>
         </div>
         <div className="status-actions">
-          <Badge tone="warning">Demo Data</Badge>
-          <span>Next automatic refresh: Vercel cron Coming Soon</span>
+          <Badge tone={liveCount ? "positive" : "warning"}>{liveCount ? `${liveCount} provider-backed assets` : "Demo Data"}</Badge>
+          <span>Next automatic refresh: Vercel cron configured in vercel.json</span>
           <button className="primary-button" type="button" onClick={onRefresh} disabled={refreshing}>
             <RefreshCw size={16} /> {refreshing ? "Refreshing" : "Manual refresh"}
           </button>
@@ -755,7 +849,7 @@ function Dashboard({
         <section className="panel">
           <h2>Market heat map</h2>
           <div className="heat-map">
-            {demoAssets.map((asset) => (
+            {assets.map((asset) => (
               <button key={asset.symbol} type="button" className={asset.changePercent >= 0 ? "heat-cell up" : "heat-cell down"} onClick={() => onOpen(asset.symbol)}>
                 <strong>{asset.symbol}</strong>
                 <span>{percent(asset.changePercent)}</span>
@@ -765,11 +859,11 @@ function Dashboard({
         </section>
         <section className="panel">
           <h2>Important market news</h2>
-          <NewsList compact onOpen={onOpen} />
+          <NewsList news={news} compact onOpen={onOpen} />
         </section>
         <section className="panel">
           <h2>Best current research setup</h2>
-          <AssetRow asset={demoAssets[0]} onOpen={onOpen} onWatch={onWatch} />
+          <AssetRow asset={assets[0] ?? demoAssets[0]} onOpen={onOpen} onWatch={onWatch} />
         </section>
         <section className="panel">
           <h2>Market sentiment</h2>
@@ -783,7 +877,7 @@ function Dashboard({
         <section className="panel">
           <h2>Daily AI market summary</h2>
           <p>
-            Demo summary: technology leadership remains visible, crypto liquidity improved, and high-volatility assets require extra risk review. Real summaries activate when Vercel provider keys and database writes are configured.
+            Market summary: provider-backed sections use internal API data when configured, while unavailable providers fall back to cached or demo-labeled values instead of pretending to be live.
           </p>
         </section>
       </div>
@@ -807,12 +901,14 @@ function DashboardPanel({ title, assets, onOpen, onWatch }: { title: string; ass
 function AssetDetail({
   asset,
   assets,
+  news,
   experience,
   onOpen,
   onWatch
 }: {
   asset: Asset;
   assets: Asset[];
+  news: NewsItem[];
   experience: ExperienceMode;
   onOpen: (symbol: string) => void;
   onWatch: (symbol: string) => void;
@@ -909,7 +1005,7 @@ function AssetDetail({
       <div className="grid">
         <section className="panel span-6">
           <h2>Related news</h2>
-          <NewsList compact onOpen={onOpen} symbols={[asset.symbol]} />
+          <NewsList news={news} compact onOpen={onOpen} symbols={[asset.symbol]} />
         </section>
         <section className="panel span-6">
           <h2>Prediction and signal history</h2>
@@ -937,6 +1033,7 @@ function Screener({
   search,
   sort,
   page,
+  assets,
   onType,
   onSearch,
   onSort,
@@ -949,6 +1046,7 @@ function Screener({
   search: string;
   sort: SortKey;
   page: number;
+  assets: Asset[];
   onType: (type: "all" | AssetType) => void;
   onSearch: (value: string) => void;
   onSort: (key: SortKey) => void;
@@ -960,14 +1058,14 @@ function Screener({
   const pageSize = 6;
   const filtered = useMemo(() => {
     const normalized = search.trim().toLowerCase();
-    return demoAssets
+    return assets
       .filter((asset) => type === "all" || asset.type === type)
       .filter((asset) => !normalized || asset.symbol.toLowerCase().includes(normalized) || asset.name.toLowerCase().includes(normalized) || asset.sector.toLowerCase().includes(normalized))
       .sort((a, b) => {
         if (sort === "symbol") return a.symbol.localeCompare(b.symbol);
         return Number(b[sort]) - Number(a[sort]);
       });
-  }, [type, search, sort]);
+  }, [assets, type, search, sort]);
   const pages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const visible = filtered.slice((page - 1) * pageSize, page * pageSize);
   return (
@@ -1047,8 +1145,8 @@ function Screener({
   );
 }
 
-function ResearchIdeas({ onOpen, onWatch }: { onOpen: (symbol: string) => void; onWatch: (symbol: string) => void }) {
-  const ranked = [...demoAssets].sort((a, b) => b.confidence - b.risk - (a.confidence - a.risk)).slice(0, 6);
+function ResearchIdeas({ assets, onOpen, onWatch }: { assets: Asset[]; onOpen: (symbol: string) => void; onWatch: (symbol: string) => void }) {
+  const ranked = [...assets].sort((a, b) => b.confidence - b.risk - (a.confidence - a.risk)).slice(0, 6);
   return (
     <section className="page">
       <PageTitle eyebrow="Research Ideas" title="Best setups and risk queues" copy="Scanner ideas from the original site, rebuilt with clearer risk labeling and transparent reasoning." />
@@ -1073,14 +1171,14 @@ function ResearchIdeas({ onOpen, onWatch }: { onOpen: (symbol: string) => void; 
   );
 }
 
-function NewsDesk({ onOpen }: { onOpen: (symbol: string) => void }) {
+function NewsDesk({ news, onOpen }: { news: NewsItem[]; onOpen: (symbol: string) => void }) {
   return (
     <section className="page">
       <PageTitle eyebrow="Market News" title="News impact desk" copy="Headlines include source, real demo timestamp, related tickers, sentiment, impact, duplicate-detection status, and article state." />
       <div className="grid">
         <section className="panel span-8">
           <h2>Headlines</h2>
-          <NewsList onOpen={onOpen} />
+          <NewsList news={news} onOpen={onOpen} />
         </section>
         <section className="panel span-4">
           <h2>News filters</h2>
@@ -1096,11 +1194,11 @@ function NewsDesk({ onOpen }: { onOpen: (symbol: string) => void }) {
   );
 }
 
-function NewsList({ onOpen, compact = false, symbols }: { onOpen: (symbol: string) => void; compact?: boolean; symbols?: string[] }) {
-  const news = symbols ? demoNews.filter((item) => item.relatedSymbols.some((symbol) => symbols.includes(symbol))) : demoNews;
+function NewsList({ news, onOpen, compact = false, symbols }: { news: NewsItem[]; onOpen: (symbol: string) => void; compact?: boolean; symbols?: string[] }) {
+  const rows = symbols ? news.filter((item) => item.relatedSymbols.some((symbol) => symbols.includes(symbol))) : news;
   return (
     <div className={compact ? "news-list compact-news" : "news-list"}>
-      {news.map((item) => (
+      {rows.map((item) => (
         <article className="news-card" key={item.id}>
           <div>
             <Badge tone={item.tone === "Positive" ? "positive" : item.tone === "Negative" ? "negative" : "warning"}>{item.tone}</Badge>
@@ -1121,11 +1219,13 @@ function NewsList({ onOpen, compact = false, symbols }: { onOpen: (symbol: strin
 
 function PredictionsPage({
   selectedAsset,
+  assets,
   scenarioAmount,
   setScenarioAmount,
   scenario
 }: {
   selectedAsset: Asset;
+  assets: Asset[];
   scenarioAmount: number;
   setScenarioAmount: (value: number) => void;
   scenario: { possibleGain: number; possibleLoss: number };
@@ -1159,7 +1259,7 @@ function PredictionsPage({
       <section className="panel">
         <h2>Prediction history</h2>
         <div className="prediction-grid">
-          {demoAssets.slice(0, 6).map((asset) => (
+          {assets.slice(0, 6).map((asset) => (
             <article className="prediction-card" key={asset.symbol}>
               <div className="row-between">
                 <strong>{asset.symbol}</strong>
@@ -1177,13 +1277,13 @@ function PredictionsPage({
   );
 }
 
-function ComparePage({ onOpen }: { onOpen: (symbol: string) => void }) {
-  const assets = demoAssets.slice(0, 4);
+function ComparePage({ assets, onOpen }: { assets: Asset[]; onOpen: (symbol: string) => void }) {
+  const compareAssets = assets.slice(0, 4);
   return (
     <section className="page">
       <PageTitle eyebrow="Compare Assets" title="Side-by-side research comparison" copy="Compare confidence, risk, data quality, signal, technical score, sentiment, and scenario ranges." />
       <div className="prediction-grid">
-        {assets.map((asset) => (
+        {compareAssets.map((asset) => (
           <article className="prediction-card" key={asset.symbol}>
             <div className="row-between">
               <strong>{asset.symbol}</strong>
@@ -1204,6 +1304,7 @@ function WatchlistsPage({
   watchlists,
   activeWatchlist,
   sort,
+  assets,
   onActive,
   onSort,
   onCreate,
@@ -1217,6 +1318,7 @@ function WatchlistsPage({
   watchlists: Array<{ id: string; name: string; symbols: string[]; notes: string }>;
   activeWatchlist: string;
   sort: SortKey;
+  assets: Asset[];
   onActive: (id: string) => void;
   onSort: (key: SortKey) => void;
   onCreate: () => void;
@@ -1228,7 +1330,7 @@ function WatchlistsPage({
   onExport: (assets: Asset[], fileName: string) => void;
 }) {
   const current = watchlists.find((list) => list.id === activeWatchlist) ?? watchlists[0];
-  const assets = demoAssets
+  const watchAssets = assets
     .filter((asset) => current.symbols.includes(asset.symbol))
     .sort((a, b) => (sort === "symbol" ? a.symbol.localeCompare(b.symbol) : Number(b[sort]) - Number(a[sort])));
   return (
@@ -1240,7 +1342,7 @@ function WatchlistsPage({
             {watchlists.map((list) => <option key={list.id} value={list.id}>{list.name}</option>)}
           </select>
           <button className="ghost-button" type="button" onClick={onCreate}>Create watchlist</button>
-          <button className="ghost-button" type="button" onClick={() => onExport(assets, `${current.name.toLowerCase().replaceAll(" ", "-")}.csv`)}>
+          <button className="ghost-button" type="button" onClick={() => onExport(watchAssets, `${current.name.toLowerCase().replaceAll(" ", "-")}.csv`)}>
             <Download size={16} /> Share/export
           </button>
           <label className="field inline">Sort
@@ -1261,7 +1363,7 @@ function WatchlistsPage({
           <input value={current.notes} onChange={(event) => onNotes(current.id, event.target.value)} placeholder="Add research notes" />
         </label>
         <div className="asset-list">
-          {assets.map((asset) => <AssetRow key={asset.symbol} asset={asset} onOpen={onOpen} onWatch={onWatch} />)}
+          {watchAssets.map((asset) => <AssetRow key={asset.symbol} asset={asset} onOpen={onOpen} onWatch={onWatch} />)}
         </div>
         {current.id !== "default" ? <button className="ghost-button danger-button" type="button" onClick={() => onDelete(current.id)}>Delete watchlist</button> : null}
       </section>
@@ -1398,12 +1500,37 @@ function SettingsPage({ adminMode, setAdminMode }: { adminMode: boolean; setAdmi
   );
 }
 
-function SystemStatus({ lastRefresh }: { lastRefresh: string }) {
+function SystemStatus({
+  lastRefresh,
+  providerRows,
+  runtimeStatus
+}: {
+  lastRefresh: string;
+  providerRows: ProviderHealth[];
+  runtimeStatus: RuntimeStatus | null;
+}) {
+  const runtimeProviders = runtimeStatus?.providers ?? [];
   return (
     <section className="page">
       <PageTitle eyebrow="Data Status" title="Public system status" copy="Provider health, delay, latency, outage, freshness, and Demo Mode state are visible without exposing secrets." />
+      <section className="panel">
+        <div className="stat-grid">
+          <Stat label="Runtime mode" value={runtimeStatus?.mode ?? "checking"} />
+          <Stat label="Market status" value={runtimeStatus?.marketStatus ?? "checking"} />
+          <Stat label="Supabase public config" value={runtimeStatus?.supabasePublicConfigured ? "Configured" : "Missing"} />
+          <Stat label="Supabase server config" value={runtimeStatus?.supabaseServerConfigured ? "Configured" : "Missing"} />
+        </div>
+      </section>
       <div className="grid">
-        {providerHealth.map((item) => (
+        {runtimeProviders.map((item) => (
+          <section className="panel span-4" key={item.name}>
+            <h2>{item.name}</h2>
+            <Badge tone={item.configured ? "positive" : "warning"}>{item.configured ? "Configured" : "Missing key"}</Badge>
+            <p>{item.status}</p>
+            <small>Supports: {item.supports.join(", ")} | Server-side only: {item.serverSideOnly ? "yes" : "no"}</small>
+          </section>
+        ))}
+        {providerRows.map((item) => (
           <section className="panel span-4" key={item.provider}>
             <h2>{item.provider}</h2>
             <Badge tone={item.marketData === "Healthy" ? "positive" : "warning"}>Market {item.marketData}</Badge>
@@ -1417,13 +1544,13 @@ function SystemStatus({ lastRefresh }: { lastRefresh: string }) {
   );
 }
 
-function AdminPage({ route }: { route: RouteId }) {
+function AdminPage({ route, runtimeStatus }: { route: RouteId; runtimeStatus: RuntimeStatus | null }) {
   const rows = [
-    ["Provider health", "Demo provider healthy; live providers missing Vercel keys."],
-    ["API usage", "No private provider calls from browser."],
+    ["Provider health", runtimeStatus ? `${runtimeStatus.mode} mode with ${runtimeStatus.providers.filter((provider) => provider.configured).length} configured providers.` : "Checking runtime provider status."],
+    ["API usage", "Browser calls only internal Next.js API routes; provider keys stay server-side."],
     ["Failed jobs", "None in Demo Mode."],
     ["Retry queues", "Scan-request queue schema exists."],
-    ["Database growth", "Supabase migrations ready."],
+    ["Database growth", runtimeStatus?.supabaseServerConfigured ? "Supabase server credentials configured." : "Supabase migrations ready; service credentials not configured here."],
     ["Audit logs", "Admin audit table defined; service-role writes only."]
   ];
   return (
@@ -1441,10 +1568,10 @@ function AdminPage({ route }: { route: RouteId }) {
   );
 }
 
-function fuzzySearchAssets(query: string) {
+function fuzzySearchAssets(query: string, assets: Asset[]) {
   const normalized = query.trim().toLowerCase();
   if (!normalized) return [];
-  return demoAssets
+  return assets
     .map((asset) => {
       const haystack = `${asset.symbol} ${asset.name} ${asset.type} ${asset.sector}`.toLowerCase();
       const direct = haystack.includes(normalized) ? 10 : 0;
