@@ -903,6 +903,15 @@ const coinGeckoHeaders = () => {
   return key ? { "x-cg-demo-api-key": key } : undefined;
 };
 
+const coinGeckoMarketChartRequest = (request: ReturnType<typeof normalizeHistoryRequest>) => {
+  const requestedDays = request.range === "MAX" ? Number.POSITIVE_INFINITY : request.days;
+  const days = Math.min(requestedDays, 365);
+  return {
+    days,
+    limited: request.range === "MAX" || requestedDays > days
+  };
+};
+
 export const getCryptoQuote = async (idInput: string, options: { refresh?: boolean } = {}): Promise<QuoteEnvelope> => {
   const id = idInput.trim().toLowerCase();
   const mapped = cryptoById[id] ?? { symbol: id.toUpperCase(), name: id };
@@ -970,10 +979,10 @@ export const getCryptoHistory = async (idInput: string, range = "1Y", options: {
   return dedupe(key, async () => {
     const attempts: ProviderAttempt[] = [];
     try {
-      const days = request.range === "MAX" ? "max" : request.days;
+      const marketChartRequest = coinGeckoMarketChartRequest(request);
       const payload = await fetchJson<{ prices?: Array<[number, number]>; total_volumes?: Array<[number, number]> }>(
         "CoinGecko",
-        `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${days}&interval=${request.interval === "5m" || request.interval === "30m" || request.interval === "1h" ? "hourly" : "daily"}`,
+        `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(id)}/market_chart?vs_currency=usd&days=${marketChartRequest.days}&interval=${request.interval === "5m" || request.interval === "30m" || request.interval === "1h" ? "hourly" : "daily"}`,
         coinGeckoHeaders(),
         8000
       );
@@ -1003,7 +1012,7 @@ export const getCryptoHistory = async (idInput: string, range = "1Y", options: {
           dataStatus: "Delayed",
           dataShape: "price-series",
           actualRange: actualRange(candles),
-          note: "CoinGecko market_chart returns price-series data here, not true OHLC candles. The frontend must display this as a line/area chart only.",
+          note: `CoinGecko market_chart returns price-series data here, not true OHLC candles. The frontend must display this as a line/area chart only.${marketChartRequest.limited ? ` This endpoint is capped at ${marketChartRequest.days} days, so the actual returned range may be shorter than the requested ${request.range} range.` : ""}`,
           generatedAt: nowIso(),
           cache: { hit: false, stale: false, ttlSeconds: Math.round(historyTtlMs / 1000) },
           attempts

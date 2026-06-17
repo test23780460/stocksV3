@@ -26,29 +26,29 @@ describe("crypto history", () => {
   });
 
   it("marks CoinGecko market_chart data as a price series instead of OHLC candles", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () =>
-        new Response(
-          JSON.stringify({
-            prices: [
-              [Date.UTC(2026, 0, 1), 100],
-              [Date.UTC(2026, 0, 2), 105]
-            ],
-            total_volumes: [
-              [Date.UTC(2026, 0, 1), 1000],
-              [Date.UTC(2026, 0, 2), 1200]
-            ]
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } }
-        )
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({
+          prices: [
+            [Date.UTC(2026, 0, 1), 100],
+            [Date.UTC(2026, 0, 2), 105]
+          ],
+          total_volumes: [
+            [Date.UTC(2026, 0, 1), 1000],
+            [Date.UTC(2026, 0, 2), 1200]
+          ]
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
       )
     );
+    vi.stubGlobal("fetch", fetchMock);
 
     const history = await getCryptoHistory("bitcoin", "1Y", { refresh: true });
     expect(history.provider).toBe("CoinGecko");
     expect(history.dataShape).toBe("price-series");
     expect(history.note).toContain("not true OHLC");
+    expect(history.note).toContain("capped at 365 days");
+    expect(fetchMock).toHaveBeenCalledWith(expect.stringContaining("days=365"), expect.any(Object));
     expect(history.candles[0].open).toBe(history.candles[0].close);
     expect(history.candles[0].high).toBe(history.candles[0].close);
     expect(history.candles[0].low).toBe(history.candles[0].close);
