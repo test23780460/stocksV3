@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getStockHistory, notFoundResponse, serverErrorResponse } from "../../../services/marketData";
+import { getStoredHistory } from "../../../services/collectorData";
+import { directProviderFallbackEnabled, getStockHistory, notFoundResponse, serverErrorResponse } from "../../../services/marketData";
 import { booleanStringSchema, intervalSchema, parseOrBadRequest, rangeSchema, symbolSchema } from "../../../services/apiValidation";
 
 export const dynamic = "force-dynamic";
@@ -17,7 +18,8 @@ export async function GET(request: Request) {
   if (refresh.error) return NextResponse.json(refresh.error, { status: 400 });
 
   try {
-    const history = await getStockHistory(symbol.data, range.data, interval.data, { refresh: Boolean(refresh.data) });
+    const stored = await getStoredHistory(symbol.data, range.data, interval.data);
+    const history = stored ?? (await getStockHistory(symbol.data, range.data, interval.data, { refresh: Boolean(refresh.data), directProviders: directProviderFallbackEnabled() }));
     return NextResponse.json(history, {
       headers: {
         "Cache-Control": refresh ? "no-store" : "s-maxage=300, stale-while-revalidate=1800"

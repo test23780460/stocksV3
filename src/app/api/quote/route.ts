@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
-import { getStockQuote, notFoundResponse, serverErrorResponse } from "../../../services/marketData";
+import { getStoredQuote } from "../../../services/collectorData";
+import { directProviderFallbackEnabled, getStockQuote, notFoundResponse, serverErrorResponse } from "../../../services/marketData";
 import { booleanStringSchema, parseOrBadRequest, symbolSchema } from "../../../services/apiValidation";
 
 export const dynamic = "force-dynamic";
@@ -13,7 +14,8 @@ export async function GET(request: Request) {
   if (refresh.error) return NextResponse.json(refresh.error, { status: 400 });
 
   try {
-    const quote = await getStockQuote(symbol.data, { refresh: Boolean(refresh.data) });
+    const stored = await getStoredQuote(symbol.data);
+    const quote = stored ?? (await getStockQuote(symbol.data, { refresh: Boolean(refresh.data), directProviders: directProviderFallbackEnabled() }));
     return NextResponse.json(quote, {
       headers: {
         "Cache-Control": refresh ? "no-store" : "s-maxage=30, stale-while-revalidate=120"

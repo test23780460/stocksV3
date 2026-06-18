@@ -7,7 +7,12 @@ export type MarketProvider =
   | "Alpha Vantage"
   | "CoinGecko"
   | "Cached data"
-  | "Demo Fixture Provider";
+  | "Demo Fixture Provider"
+  | "Alpaca"
+  | "Massive"
+  | "Local Collector"
+  | "Supabase Collector"
+  | (string & {});
 
 export interface ProviderAttempt {
   provider: MarketProvider;
@@ -136,6 +141,32 @@ export interface RuntimeStatus {
     news: number;
     providerHealth: number;
   };
+  collector?: {
+    status: "online" | "starting" | "paused" | "paused_quiet_hours" | "delayed" | "offline" | "manually_stopped" | "crashed" | "shutting_down" | "unavailable";
+    label: string;
+    message: string;
+    lastHeartbeat: string | null;
+    heartbeatAgeSeconds: number | null;
+    lastSuccessfulUpdate: string | null;
+    lastBroadScan: string | null;
+    lastPriorityScan: string | null;
+    websocketStatus: string | null;
+    liveSymbolCount: number;
+    assetsStored: number;
+    latestQuotesStored: number;
+    assetsScanned: number;
+    recordsWritten: number;
+    currentJob: string | null;
+    lastError: string | null;
+  };
+  marketCoverage?: {
+    marketUniverse: number;
+    broadScanner: string;
+    priorityScanner: string;
+    liveScanner: string;
+    lastCompleteBroadScan: string | null;
+    source: string;
+  };
 }
 
 type ErrorCode = "missing-key" | "not-found" | "rate-limited" | "provider-error" | "timeout";
@@ -182,8 +213,11 @@ const requiredEnvironment = [
   { name: "NEWS_API_KEY", public: false },
   { name: "CRON_SECRET", public: false },
   { name: "MARKET_DATA_PROVIDER", public: false },
-  { name: "NEWS_DATA_PROVIDER", public: false }
+  { name: "NEWS_DATA_PROVIDER", public: false },
+  { name: "WEBSITE_DIRECT_PROVIDER_FALLBACK", public: false }
 ];
+
+export const directProviderFallbackEnabled = () => process.env.WEBSITE_DIRECT_PROVIDER_FALLBACK === "true";
 
 const cache = new Map<string, { value: unknown; expiresAt: number; writtenAt: number; ttlMs: number }>();
 const pending = new Map<string, Promise<unknown>>();
@@ -743,7 +777,7 @@ const resolveStockQuoteFresh = async (symbol: string, attempts: ProviderAttempt[
   throw new MarketDataError("Demo Fixture Provider", "provider-error", "No live stock provider returned usable quote data.");
 };
 
-export const getStockQuote = async (symbolInput: string, options: { refresh?: boolean } = {}): Promise<QuoteEnvelope> => {
+export const getStockQuote = async (symbolInput: string, options: { refresh?: boolean; directProviders?: boolean } = {}): Promise<QuoteEnvelope> => {
   const symbol = normalizeSymbol(symbolInput);
   const key = `stock-quote:${symbol}`;
   const cached = !options.refresh ? getCache<QuoteEnvelope>(key) : null;
@@ -758,6 +792,10 @@ export const getStockQuote = async (symbolInput: string, options: { refresh?: bo
 
   return dedupe(key, async () => {
     const attempts: ProviderAttempt[] = [];
+    if (options.directProviders === false) {
+      attempts.push({ provider: "Demo Fixture Provider", status: "skipped", message: "Direct public provider fallback is disabled; collector/Supabase data is preferred." });
+      return demoQuote(symbol, attempts);
+    }
     try {
       const quote = await resolveStockQuoteFresh(symbol, attempts);
       return setCache(
@@ -853,7 +891,7 @@ const alphaHistory = async (symbol: string): Promise<Bar[]> => {
   );
 };
 
-export const getStockHistory = async (symbolInput: string, range = "1Y", interval = "1D", options: { refresh?: boolean } = {}): Promise<HistoryEnvelope> => {
+export const getStockHistory = async (symbolInput: string, range = "1Y", interval = "1D", options: { refresh?: boolean; directProviders?: boolean } = {}): Promise<HistoryEnvelope> => {
   const symbol = normalizeSymbol(symbolInput);
   const request = normalizeHistoryRequest(range, interval);
   const key = `stock-history:${symbol}:${request.range}:${request.interval}`;
@@ -862,6 +900,10 @@ export const getStockHistory = async (symbolInput: string, range = "1Y", interva
 
   return dedupe(key, async () => {
     const attempts: ProviderAttempt[] = [];
+    if (options.directProviders === false) {
+      attempts.push({ provider: "Demo Fixture Provider", status: "skipped", message: "Direct public provider fallback is disabled; collector/Supabase data is preferred." });
+      return demoHistory(symbol, request.range, request.interval, attempts);
+    }
     for (const [provider, task] of [
       ["Finnhub", () => finnhubHistory(symbol, request.range)],
       ["Twelve Data", () => twelveHistory(symbol, request.range)],
@@ -1030,7 +1072,7 @@ export const getCryptoHistory = async (idInput: string, range = "1Y", options: {
   });
 };
 
-export const getSearchResults = async (queryInput: string): Promise<SearchEnvelope> => {
+export const getSearchResults = async (queryInput: string, options: { directProviders?: boolean } = {}): Promise<SearchEnvelope> => {
   const query = queryInput.trim();
   const key = `search:${query.toLowerCase()}`;
   const cached = getCache<SearchEnvelope>(key);
@@ -1056,41 +1098,45 @@ export const getSearchResults = async (queryInput: string): Promise<SearchEnvelo
 
   if (!query) return { query, results: [], generatedAt: nowIso(), cache: { hit: false, stale: false, ttlSeconds: 0 }, attempts };
 
-  try {
-    const keyValue = providerEnv.finnhub();
-    if (!keyValue) throw missingKey("Finnhub", "FINNHUB_API_KEY");
-    const payload = await fetchJson<{ result?: Array<{ symbol?: string; description?: string; type?: string }> }>("Finnhub", `https://finnhub.io/api/v1/search?q=${encodeURIComponent(query)}&token=${encodeURIComponent(keyValue)}`);
-    payload.result?.slice(0, 10).forEach((item) => {
-      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.description || item.symbol, type: "stock", provider: "Finnhub", dataStatus: "Delayed" });
-    });
-    attempts.push({ provider: "Finnhub", status: "success", message: "Finnhub search returned results." });
-  } catch (error) {
-    attempts.push(sanitizeProviderError("Finnhub", error));
-  }
+  if (options.directProviders !== false) {
+    try {
+      const keyValue = providerEnv.finnhub();
+      if (!keyValue) throw missingKey("Finnhub", "FINNHUB_API_KEY");
+      const payload = await fetchJson<{ result?: Array<{ symbol?: string; description?: string; type?: string }> }>("Finnhub", `https://finnhub.io/api/v1/search?q=${encodeURIComponent(query)}&token=${encodeURIComponent(keyValue)}`);
+      payload.result?.slice(0, 10).forEach((item) => {
+        if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.description || item.symbol, type: "stock", provider: "Finnhub", dataStatus: "Delayed" });
+      });
+      attempts.push({ provider: "Finnhub", status: "success", message: "Finnhub search returned results." });
+    } catch (error) {
+      attempts.push(sanitizeProviderError("Finnhub", error));
+    }
 
-  try {
-    const keyValue = providerEnv.twelveData();
-    if (!keyValue) throw missingKey("Twelve Data", "TWELVE_DATA_API_KEY");
-    const payload = await fetchJson<{ data?: Array<{ symbol?: string; instrument_name?: string; exchange?: string; instrument_type?: string }> }>("Twelve Data", `https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(query)}&apikey=${encodeURIComponent(keyValue)}`);
-    payload.data?.slice(0, 10).forEach((item) => {
-      if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.instrument_name || item.symbol, type: "stock", exchange: item.exchange, provider: "Twelve Data", dataStatus: "Delayed" });
-    });
-    attempts.push({ provider: "Twelve Data", status: "success", message: "Twelve Data search returned results." });
-  } catch (error) {
-    attempts.push(sanitizeProviderError("Twelve Data", error));
-  }
+    try {
+      const keyValue = providerEnv.twelveData();
+      if (!keyValue) throw missingKey("Twelve Data", "TWELVE_DATA_API_KEY");
+      const payload = await fetchJson<{ data?: Array<{ symbol?: string; instrument_name?: string; exchange?: string; instrument_type?: string }> }>("Twelve Data", `https://api.twelvedata.com/symbol_search?symbol=${encodeURIComponent(query)}&apikey=${encodeURIComponent(keyValue)}`);
+      payload.data?.slice(0, 10).forEach((item) => {
+        if (item.symbol) results.set(item.symbol, { symbol: item.symbol, name: item.instrument_name || item.symbol, type: "stock", exchange: item.exchange, provider: "Twelve Data", dataStatus: "Delayed" });
+      });
+      attempts.push({ provider: "Twelve Data", status: "success", message: "Twelve Data search returned results." });
+    } catch (error) {
+      attempts.push(sanitizeProviderError("Twelve Data", error));
+    }
 
-  try {
-    const keyValue = providerEnv.alphaVantage();
-    if (!keyValue) throw missingKey("Alpha Vantage", "ALPHA_VANTAGE_API_KEY");
-    const payload = await fetchJson<{ bestMatches?: Array<Record<string, string>> }>("Alpha Vantage", `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(query)}&apikey=${encodeURIComponent(keyValue)}`);
-    payload.bestMatches?.slice(0, 10).forEach((item) => {
-      const symbol = item["1. symbol"];
-      if (symbol) results.set(symbol, { symbol, name: item["2. name"] || symbol, type: "stock", exchange: item["4. region"], provider: "Alpha Vantage", dataStatus: "Delayed" });
-    });
-    attempts.push({ provider: "Alpha Vantage", status: "success", message: "Alpha Vantage search returned results." });
-  } catch (error) {
-    attempts.push(sanitizeProviderError("Alpha Vantage", error));
+    try {
+      const keyValue = providerEnv.alphaVantage();
+      if (!keyValue) throw missingKey("Alpha Vantage", "ALPHA_VANTAGE_API_KEY");
+      const payload = await fetchJson<{ bestMatches?: Array<Record<string, string>> }>("Alpha Vantage", `https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(query)}&apikey=${encodeURIComponent(keyValue)}`);
+      payload.bestMatches?.slice(0, 10).forEach((item) => {
+        const symbol = item["1. symbol"];
+        if (symbol) results.set(symbol, { symbol, name: item["2. name"] || symbol, type: "stock", exchange: item["4. region"], provider: "Alpha Vantage", dataStatus: "Delayed" });
+      });
+      attempts.push({ provider: "Alpha Vantage", status: "success", message: "Alpha Vantage search returned results." });
+    } catch (error) {
+      attempts.push(sanitizeProviderError("Alpha Vantage", error));
+    }
+  } else {
+    attempts.push({ provider: "Demo Fixture Provider", status: "skipped", message: "Direct public provider search fallback is disabled; collector/Supabase assets are preferred." });
   }
 
   addDemoResults();
@@ -1198,7 +1244,7 @@ export const getMarketSnapshot = async (options: { refresh?: boolean } = {}): Pr
   if (cached) return { ...cached.value, generatedAt: nowIso(), cache: cached.cache };
 
   return dedupe(key, async () => {
-    const stockKeysConfigured = Boolean(providerEnv.finnhub() || providerEnv.twelveData() || providerEnv.alphaVantage());
+    const stockKeysConfigured = directProviderFallbackEnabled() && Boolean(providerEnv.finnhub() || providerEnv.twelveData() || providerEnv.alphaVantage());
     const assets = await Promise.all(
       demoAssets.map(async (asset) => {
         try {

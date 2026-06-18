@@ -40,7 +40,7 @@ import { compactNumber, currency, formatDateTime, percent } from "./lib/format";
 import { explainStatus, statusSeverity } from "./lib/dataStatus";
 import { parseRoutePath, pathForAsset, pathForRoute, type RouteId } from "./lib/routing";
 import { hasSupabaseConfig } from "./supabaseClient";
-import type { Asset, AssetType, NewsItem, ProviderHealth, SignalLabel } from "./types";
+import type { Asset, AssetType, DataStatus, NewsItem, ProviderHealth, SignalLabel } from "./types";
 import type { ApiQuote, HistoryEnvelope, RuntimeStatus, SearchResult } from "./services/marketData";
 
 type ExperienceMode = "beginner" | "intermediate" | "advanced";
@@ -225,6 +225,21 @@ function PageTitle({ eyebrow, title, copy }: { eyebrow: string; title: string; c
 
 function DataPill({ asset }: { asset: Asset }) {
   return <Badge tone={statusSeverity(asset.meta.dataStatus)}>{asset.meta.dataStatus}</Badge>;
+}
+
+const providerBackedStatuses: DataStatus[] = ["Live", "Real-time IEX", "Provider-supplied", "Near real-time", "Delayed", "Intraday snapshot", "End-of-day", "Cached", "Stale"];
+
+function collectorTone(status?: NonNullable<RuntimeStatus["collector"]>["status"]) {
+  if (status === "online") return "positive";
+  if (status === "offline" || status === "crashed") return "negative";
+  return "warning";
+}
+
+function relativeAge(seconds: number | null | undefined) {
+  if (seconds === null || seconds === undefined) return "unknown";
+  if (seconds < 60) return `${seconds} seconds ago`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)} minutes ago`;
+  return `${Math.round(seconds / 3600)} hours ago`;
 }
 
 function AssetRow({
@@ -459,7 +474,7 @@ export default function App({ initialPath = "/" }: { initialPath?: string }) {
     setProviderRows(payload.providerHealth.length ? payload.providerHealth : providerHealth);
     setRuntimeStatus(payload.status);
     setLastRefresh(payload.generatedAt);
-    const liveCount = payload.assets.filter((asset) => asset.meta.dataStatus === "Live" || asset.meta.dataStatus === "Delayed").length;
+    const liveCount = payload.assets.filter((asset) => providerBackedStatuses.includes(asset.meta.dataStatus)).length;
     const sourceLabel = payload.cache.hit ? "Cached" : liveCount ? "Provider-backed" : "Demo fallback";
     setToast(`${sourceLabel} market data loaded. ${liveCount}/${payload.assets.length} assets have provider-backed labels.`);
   };
@@ -850,12 +865,12 @@ function Sidebar({
         })}
       </nav>
       <div className="status-card">
-        <Badge tone={runtimeStatus?.mode === "live" ? "positive" : runtimeStatus?.mode === "unavailable" ? "negative" : "warning"}>
-          {runtimeStatus?.applicationMode ?? "Checking"}
+        <Badge tone={runtimeStatus?.collector ? collectorTone(runtimeStatus.collector.status) : runtimeStatus?.mode === "live" ? "positive" : runtimeStatus?.mode === "unavailable" ? "negative" : "warning"}>
+          {runtimeStatus?.collector?.label ?? runtimeStatus?.applicationMode ?? "Checking"}
         </Badge>
         <p>
           {runtimeStatus
-            ? `Stocks: ${runtimeStatus.stockMarketStatus}. Crypto: ${runtimeStatus.cryptoMarketStatus}. Cron: backend ingestion scheduled daily at 09:00 UTC.`
+            ? `${runtimeStatus.collector?.message ?? `Stocks: ${runtimeStatus.stockMarketStatus}. Crypto: ${runtimeStatus.cryptoMarketStatus}.`} Last heartbeat: ${relativeAge(runtimeStatus.collector?.heartbeatAgeSeconds)}.`
             : "Runtime status is loading from the internal API."}
         </p>
       </div>
@@ -1050,7 +1065,7 @@ function Dashboard({
   ];
   const watchAssets = assets.filter((asset) => watchlist.symbols.includes(asset.symbol));
   const indexes = assets.filter((asset) => asset.type === "index" || asset.type === "etf").slice(0, 5);
-  const liveCount = assets.filter((asset) => asset.meta.dataStatus === "Live" || asset.meta.dataStatus === "Delayed").length;
+  const liveCount = assets.filter((asset) => providerBackedStatuses.includes(asset.meta.dataStatus)).length;
   const providerLabel = runtimeStatus?.applicationMode ?? "Checking";
   const easternTime = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
@@ -1079,6 +1094,7 @@ function Dashboard({
           </button>
         </div>
       </section>
+      <CollectorStatusPanel runtimeStatus={runtimeStatus} />
       <div className="dashboard-grid">
         <DashboardPanel title={`Watchlist: ${watchlist.name}`} assets={watchAssets} onOpen={onOpen} onWatch={onWatch} />
         <DashboardPanel title="Major market indexes" assets={indexes} onOpen={onOpen} onWatch={onWatch} />
@@ -1116,11 +1132,41 @@ function Dashboard({
           </p>
         </section>
         <section className="panel">
+          <h2>Market coverage</h2>
+          <div className="stat-grid compact-stats">
+            <Stat label="Market universe" value={runtimeStatus?.marketCoverage?.marketUniverse ?? assets.length} note={runtimeStatus?.marketCoverage?.source ?? "Demo/provider fallback"} />
+            <Stat label="Broad scanner" value={runtimeStatus?.marketCoverage?.broadScanner ?? "Configured after collector data is stored"} />
+            <Stat label="Priority scanner" value={runtimeStatus?.marketCoverage?.priorityScanner ?? "Configured after collector data is stored"} />
+            <Stat label="Live scanner" value={runtimeStatus?.marketCoverage?.liveScanner ?? "Up to 30 symbols when Alpaca IEX streaming is configured"} />
+          </div>
+        </section>
+        <section className="panel">
           <h2>Daily AI market summary</h2>
           <p>
             Market summary: provider-backed sections use internal API data when configured, while unavailable providers fall back to cached or demo-labeled values instead of pretending to be live.
           </p>
         </section>
+      </div>
+    </section>
+  );
+}
+
+function CollectorStatusPanel({ runtimeStatus }: { runtimeStatus: RuntimeStatus | null }) {
+  const collector = runtimeStatus?.collector;
+  return (
+    <section className="collector-panel">
+      <div>
+        <Badge tone={collectorTone(collector?.status)}>{collector?.label ?? "Collector status loading"}</Badge>
+        <h2>{collector?.message ?? "Checking collector status"}</h2>
+        <p>
+          Last heartbeat: {relativeAge(collector?.heartbeatAgeSeconds)} | Last update: {collector?.lastSuccessfulUpdate ? formatDateTime(collector.lastSuccessfulUpdate) : "not stored yet"}
+        </p>
+      </div>
+      <div className="collector-stats">
+        <Stat label="Stored assets" value={collector?.assetsStored ?? 0} />
+        <Stat label="Latest quotes" value={collector?.latestQuotesStored ?? 0} />
+        <Stat label="Live symbols" value={collector?.liveSymbolCount ?? 0} />
+        <Stat label="Current job" value={collector?.currentJob ?? "none"} />
       </div>
     </section>
   );
@@ -1776,6 +1822,10 @@ function SystemStatus({
       <section className="panel">
         <div className="stat-grid">
           <Stat label="Runtime mode" value={runtimeStatus?.mode ?? "checking"} />
+          <Stat label="Collector" value={runtimeStatus?.collector?.label ?? "checking"} note={runtimeStatus?.collector?.message} />
+          <Stat label="Last heartbeat" value={relativeAge(runtimeStatus?.collector?.heartbeatAgeSeconds)} />
+          <Stat label="Stored assets" value={runtimeStatus?.collector?.assetsStored ?? 0} />
+          <Stat label="Latest quotes" value={runtimeStatus?.collector?.latestQuotesStored ?? 0} />
           <Stat label="Stock market" value={runtimeStatus?.stockMarketStatus ?? "checking"} />
           <Stat label="Crypto market" value={runtimeStatus?.cryptoMarketStatus ?? "checking"} />
           <Stat label="Supabase public config" value={runtimeStatus?.supabasePublicConfigured ? "Configured" : "Missing"} />

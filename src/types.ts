@@ -2,13 +2,19 @@ export type AssetType = "stock" | "crypto" | "etf" | "index" | "option";
 export type SignalLabel = "Watch" | "Wait" | "Avoid" | "Research further";
 export type DataStatus =
   | "Live"
+  | "Real-time IEX"
+  | "Provider-supplied"
+  | "Near real-time"
   | "Delayed"
+  | "Intraday snapshot"
+  | "End-of-day"
   | "Cached"
   | "Demo"
   | "Market closed"
   | "Stale"
   | "Incomplete"
   | "Temporarily unavailable"
+  | "Unavailable"
   | "Provider error"
   | "Rate limited";
 export type UserRole = "guest" | "free" | "premium" | "admin";
